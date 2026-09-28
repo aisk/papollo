@@ -78,6 +78,19 @@ has a thread. papollo resets its own state in the child, but other libraries may
 read config only in the workers, for example from gunicorn's `post_fork` hook, and not in the
 master process.
 
+To start while the config service is down, set `cache_dir`, like the Java client's local cache.
+Every new release fetched is also written to `{app_id}+{cluster}+{namespace}.json` in that
+directory, which is created if missing. Files are replaced atomically, so processes can share a
+directory, and are only readable by their owner as configs may hold secrets. When a namespace fails
+to load because the server is unreachable or answers with a 5xx, a read serves the cached file
+instead and logs a warning. Errors such as a wrong `secret` or an unknown namespace are raised as
+usual, a stale cache would only hide them. `refresh(name)` loads the cached file too but still
+raises, so a fail fast check at startup notices, and reads after it are served from the cache. From
+then on the namespace counts as loaded with the cached release, which `refresh()`, `max_age` or
+`watch` refetch like any other, and listeners are called when the server has a newer one. A cache
+file that can not be read is ignored and failing to write one never fails a fetch, both are logged
+as warnings.
+
 Other options: `cluster`, `secret` (access key), `ip` and `label` (gray release), `timeout`, and
 `http_client` to bring your own `httpx.Client` / `httpx.AsyncClient`. When `timeout` is not set, the
 httpx client's own timeout is used. `ip` is not detected automatically, so IP based gray release
