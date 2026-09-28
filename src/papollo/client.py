@@ -3,7 +3,7 @@ import socket
 import sys
 import threading
 from collections.abc import Callable, Mapping
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from time import monotonic
 from types import TracebackType
 from typing import Any, TypeVar, overload
@@ -62,6 +62,7 @@ class Apollo:
         watch: bool = False,
         cache_dir: str | os.PathLike[str] | None = None,
         http_client: httpx.Client | None = None,
+        watch_http_client: httpx.Client | None = None,
     ) -> None:
         self._settings = Settings(
             server_url.rstrip("/"), app_id, cluster, secret, ip, label, timeout
@@ -77,6 +78,7 @@ class Apollo:
         self._listeners_lock = threading.Lock()
         self._locks: dict[str, threading.Lock] = {}
         self._watch = watch
+        self._watch_http = watch_http_client
         self._notification_ids: dict[str, int] = {}
         self._closed = False
         self._init_poller()
@@ -316,7 +318,9 @@ class Apollo:
 
     def _poll_forever(self) -> None:
         delay = _core.RETRY_DELAYS[0]
-        with self._create_poll_http() as http:
+        # Not http_client, as each long poll holds a connection for up to a minute.
+        http = self._watch_http or httpx.Client()
+        with nullcontext(http) if http is self._watch_http else http:
             while not self._stop.is_set():
                 try:
                     self._poll(http)
@@ -332,17 +336,14 @@ class Apollo:
                 else:
                     delay = _core.RETRY_DELAYS[0]
 
-    def _create_poll_http(self) -> httpx.Client:
-        # A separate client, a pooled connection of the user's own would be held for a minute.
-        # Keep-alive is off so every long poll has its own socket, see _trace().
-        return httpx.Client(limits=httpx.Limits(max_keepalive_connections=0))
-
     def _poll(self, http: httpx.Client) -> None:
         with self._poll_lock:
             ids = {name: self._notification_ids.get(name, -1) for name in list(self._snapshots)}
             self._polled = frozenset(ids)
         try:
             request = self._settings.build_notifications_request(http, ids)
+            # So every long poll opens a connection of its own, and _trace() sees its socket.
+            request.headers["Connection"] = "close"
             request.extensions["trace"] = self._trace
             response = http.send(request)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:

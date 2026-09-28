@@ -252,6 +252,26 @@ async def test_watch_fork(
     assert watching._poll_task is parent_task
 
 
+async def test_watch_http_client(app: App, recorder: ResponseRecorder) -> None:
+    changed = asyncio.Event()
+    async with (
+        httpx.AsyncClient(
+            headers={"X-Test": "1"}, event_hooks={"response": [recorder.async_hook]}
+        ) as http,
+        AsyncApollo(app.config_url, app.app_id, watch=True, watch_http_client=http) as client,
+    ):
+        client.add_listener(lambda ns, old, new: changed.set())
+        await client.get("timeout")
+        await wait_polling(client, "application")
+        app.publish("application", "timeout=60")
+        await asyncio.wait_for(changed.wait(), 10)
+        await client.aclose()
+        assert not http.is_closed
+    polls = [r.request for r in recorder.responses]
+    assert polls and all(r.url.path == "/notifications/v2" for r in polls)
+    assert all(r.headers["X-Test"] == "1" for r in polls)
+
+
 def test_watch_restarts_in_new_loop(app: App) -> None:
     client = AsyncApollo(app.config_url, app.app_id, watch=True)
     changed: list[str] = []
@@ -415,17 +435,12 @@ async def test_listener_errors_logged(
 
 
 @pytest.fixture
-async def fake_watching(
-    fake_apollo: FakeApollo, monkeypatch: pytest.MonkeyPatch
-) -> AsyncIterator[AsyncApollo]:
-    def create_poll_http(self: AsyncApollo) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(fake_apollo.async_handler))
-
-    monkeypatch.setattr(AsyncApollo, "_create_poll_http", create_poll_http)
-    http = httpx.AsyncClient(transport=httpx.MockTransport(fake_apollo.async_handler))
+async def fake_watching(fake_apollo: FakeApollo) -> AsyncIterator[AsyncApollo]:
     async with (
-        http,
-        AsyncApollo("http://apollo:8080", "demo", watch=True, http_client=http) as client,
+        httpx.AsyncClient(transport=httpx.MockTransport(fake_apollo.async_handler)) as http,
+        AsyncApollo(
+            "http://apollo:8080", "demo", watch=True, http_client=http, watch_http_client=http
+        ) as client,
     ):
         yield client
 
@@ -650,20 +665,19 @@ async def test_cache_write_failure_logged(
 
 
 @pytest.mark.usefixtures("fast_retry")
-async def test_cache_watch_catches_up(
-    fake_apollo: FakeApollo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def create_poll_http(self: AsyncApollo) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(fake_apollo.async_handler))
-
-    monkeypatch.setattr(AsyncApollo, "_create_poll_http", create_poll_http)
+async def test_cache_watch_catches_up(fake_apollo: FakeApollo, tmp_path: Path) -> None:
     path = write_cache(tmp_path, "application", "r1", {"timeout": "30", "name": "demo"})
     fake_apollo.fail_with = 500
     http = httpx.AsyncClient(transport=httpx.MockTransport(fake_apollo.async_handler))
     async with (
         http,
         AsyncApollo(
-            "http://apollo:8080", "demo", watch=True, cache_dir=tmp_path, http_client=http
+            "http://apollo:8080",
+            "demo",
+            watch=True,
+            cache_dir=tmp_path,
+            http_client=http,
+            watch_http_client=http,
         ) as client,
     ):
         assert await client.get("timeout") == "30"

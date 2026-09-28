@@ -296,6 +296,30 @@ def test_watch_fork(app: App, watching: Apollo, caplog: pytest.LogCaptureFixture
     assert caplog.records == []
 
 
+def test_watch_http_client(app: App, recorder: ResponseRecorder) -> None:
+    # A client of the user's own, with keep-alive on, so settings like certificates apply.
+    with (
+        httpx.Client(headers={"X-Test": "1"}, event_hooks={"response": [recorder]}) as http,
+        Apollo(app.config_url, app.app_id, watch=True, watch_http_client=http) as client,
+    ):
+        changed = threading.Event()
+        client.add_listener(lambda ns, old, new: changed.set())
+        client.get("timeout")
+        wait_polling(client, "application")
+        app.publish("application", "timeout=60")
+        assert changed.wait(10)
+        # Every poll gets a connection of its own, so a new namespace or close() can abort it.
+        client.namespace("app.json")
+        wait_polling(client, "application", "app.json")
+        started = time.monotonic()
+        client.close()
+        assert time.monotonic() - started < 2
+        assert not http.is_closed
+    polls = [r.request for r in recorder.responses]
+    assert polls and all(r.url.path == "/notifications/v2" for r in polls)
+    assert all(r.headers["X-Test"] == "1" for r in polls)
+
+
 def test_watch_off_by_default(client: Apollo) -> None:
     client.get("timeout")
     assert client._poller is None
@@ -523,13 +547,13 @@ def test_fork_keeps_given_http_client(fake_client: Apollo) -> None:
 
 
 @pytest.fixture
-def fake_watching(fake_apollo: FakeApollo, monkeypatch: pytest.MonkeyPatch) -> Iterator[Apollo]:
-    def create_poll_http(self: Apollo) -> httpx.Client:
-        return httpx.Client(transport=httpx.MockTransport(fake_apollo.handler))
-
-    monkeypatch.setattr(Apollo, "_create_poll_http", create_poll_http)
-    http = httpx.Client(transport=httpx.MockTransport(fake_apollo.handler))
-    with http, Apollo("http://apollo:8080", "demo", watch=True, http_client=http) as client:
+def fake_watching(fake_apollo: FakeApollo) -> Iterator[Apollo]:
+    with (
+        httpx.Client(transport=httpx.MockTransport(fake_apollo.handler)) as http,
+        Apollo(
+            "http://apollo:8080", "demo", watch=True, http_client=http, watch_http_client=http
+        ) as client,
+    ):
         yield client
 
 
@@ -824,19 +848,17 @@ def test_cache_path_stays_in_directory(tmp_path: Path) -> None:
 
 @pytest.mark.usefixtures("fast_retry")
 def test_cache_watch_catches_up(
-    fake_apollo: FakeApollo,
-    fake_http: httpx.Client,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    fake_apollo: FakeApollo, fake_http: httpx.Client, tmp_path: Path
 ) -> None:
-    def create_poll_http(self: Apollo) -> httpx.Client:
-        return httpx.Client(transport=httpx.MockTransport(fake_apollo.handler))
-
-    monkeypatch.setattr(Apollo, "_create_poll_http", create_poll_http)
     path = write_cache(tmp_path, "application", "r1", {"timeout": "30", "name": "demo"})
     fake_apollo.fail_with = 500
     with Apollo(
-        "http://apollo:8080", "demo", watch=True, cache_dir=tmp_path, http_client=fake_http
+        "http://apollo:8080",
+        "demo",
+        watch=True,
+        cache_dir=tmp_path,
+        http_client=fake_http,
+        watch_http_client=fake_http,
     ) as client:
         assert client.get("timeout") == "30"
         wait_until(lambda: fake_apollo.poll_requests)

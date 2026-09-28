@@ -49,9 +49,11 @@ notification endpoint for every loaded namespace, and refetches a namespace as s
 reports a new release for it. Polling starts with the first read or `refresh()`, not when the client
 is created, so a client created at import time in a process that never reads it runs nothing. An
 `Apollo` polls in a daemon thread, an `AsyncApollo` in a task of its event loop. A namespace loaded
-later aborts the poll in flight so the next one covers it too. The long poll uses its own httpx
-client, as the server holds each request for up to 60 seconds, never the `http_client` you pass
-in, so settings like `verify` or a proxy given to that client do not apply to it. Failures are
+later aborts the poll in flight so the next one covers it too. As the server holds each poll for up to
+60 seconds, polling does not use `http_client` but an httpx client of its own. Pass
+`watch_http_client` when it needs settings too, such as `verify` for an internal CA, a proxy or
+headers. Give it a client used for nothing else, papollo sends every poll on a new HTTP/1.1
+connection so it can abort it, and leaves the client open. Failures are
 logged as warnings to the `papollo` logger and retried after a delay doubling from 1 up to 120
 seconds. `close()` and `aclose()` stop polling right away. The poller keeps the client alive until
 then, so always close a watching client that does not live as long as the process. `max_age` can be

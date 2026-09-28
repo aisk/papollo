@@ -3,6 +3,7 @@ import inspect
 import os
 import sys
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import nullcontext
 from time import monotonic
 from types import TracebackType
 from typing import TypeVar, overload
@@ -56,6 +57,7 @@ class AsyncApollo:
         watch: bool = False,
         cache_dir: str | os.PathLike[str] | None = None,
         http_client: httpx.AsyncClient | None = None,
+        watch_http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._settings = Settings(
             server_url.rstrip("/"), app_id, cluster, secret, ip, label, timeout
@@ -69,6 +71,7 @@ class AsyncApollo:
         self._listeners: tuple[AsyncListener, ...] = ()
         self._locks: dict[str, asyncio.Lock] = {}
         self._watch = watch
+        self._watch_http = watch_http_client
         self._notification_ids: dict[str, int] = {}
         self._closed = False
         # The poller task is created by the first read, in the loop the client is used in.
@@ -283,7 +286,9 @@ class AsyncApollo:
 
     async def _poll_forever(self) -> None:
         delay = _core.RETRY_DELAYS[0]
-        async with self._create_poll_http() as http:
+        # Not http_client, as each long poll holds a connection for up to a minute.
+        http = self._watch_http or httpx.AsyncClient()
+        async with nullcontext(http) if http is self._watch_http else http:
             # Checked as aclose() does not cancel the poller when a listener calls it from here.
             while not self._closed:
                 try:
@@ -299,10 +304,6 @@ class AsyncApollo:
                     delay = min(delay * 2, _core.RETRY_DELAYS[1])
                 else:
                     delay = _core.RETRY_DELAYS[0]
-
-    def _create_poll_http(self) -> httpx.AsyncClient:
-        # A separate client, a pooled connection of the user's own would be held for a minute.
-        return httpx.AsyncClient()
 
     async def _poll(self, http: httpx.AsyncClient) -> None:
         ids = {name: self._notification_ids.get(name, -1) for name in self._snapshots}
