@@ -6,10 +6,32 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{ name = "An Long", email = "aisk1988@gmail.com" }]
+keywords = ["apollo", "config", "configuration", "config-center", "asyncio", "httpx"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx>=0.28",
     "typing-extensions>=4.0 ; python_full_version < '3.11'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/aisk/papollo"
+Repository = "https://github.com/aisk/papollo"
+Issues = "https://github.com/aisk/papollo/issues"
 
 [dependency-groups]
 dev = [
