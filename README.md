@@ -51,9 +51,11 @@ is created, so a client created at import time in a process that never reads it 
 `Apollo` polls in a daemon thread, an `AsyncApollo` in a task of its event loop. A namespace loaded
 later aborts the poll in flight so the next one covers it too. The long poll uses its own httpx
 client, as the server holds each request for up to 60 seconds, never the `http_client` you pass
-in. Failures are logged as warnings to the `papollo` logger and retried after a delay doubling from
-1 up to 120 seconds. `close()` and `aclose()` stop polling right away. `max_age` can be combined
-with `watch` as a fallback in case notifications are lost.
+in, so settings like `verify` or a proxy given to that client do not apply to it. Failures are
+logged as warnings to the `papollo` logger and retried after a delay doubling from 1 up to 120
+seconds. `close()` and `aclose()` stop polling right away. The poller keeps the client alive until
+then, so always close a watching client that does not live as long as the process. `max_age` can be
+combined with `watch` as a fallback in case notifications are lost.
 
 ```python
 client = Apollo("http://apollo-config:8080", "demo-app", watch=True)
