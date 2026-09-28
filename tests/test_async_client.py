@@ -6,7 +6,7 @@ import pytest
 
 from papollo import ApolloError, AsyncApollo
 
-from .conftest import App, FakeApollo, ResponseRecorder
+from .conftest import App, FakeApollo, ResponseRecorder, requires_fork, run_in_child
 
 
 @pytest.fixture
@@ -66,6 +66,20 @@ async def test_access_key(app: App) -> None:
     secret = app.portal.enable_access_key(app.app_id)
     async with AsyncApollo(app.config_url, app.app_id, secret=secret) as client:
         assert await client.get("timeout") == "30"
+
+
+@requires_fork
+def test_fork(app: App) -> None:
+    # Not a coroutine, the parent and the child each run their own event loop.
+    client = AsyncApollo(app.config_url, app.app_id)
+    assert asyncio.run(client.get("timeout")) == "30"
+    app.publish("application", "timeout=60")
+
+    async def refresh_and_get() -> str | None:
+        await client.refresh()
+        return await client.get("timeout")
+
+    assert run_in_child(lambda: asyncio.run(refresh_and_get())) == "60"
 
 
 # The tests below need no server, or a failure a real server can not produce on demand.

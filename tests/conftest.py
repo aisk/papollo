@@ -9,9 +9,11 @@ case they fail. The portal is used to create apps and publish releases.
 
 import json
 import os
+import pickle
+import signal
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import httpx
@@ -23,6 +25,8 @@ PORTAL_USER = os.environ.get("APOLLO_PORTAL_USER", "apollo")
 PORTAL_PASSWORD = os.environ.get("APOLLO_PORTAL_PASSWORD", "admin")
 ENV = os.environ.get("APOLLO_ENV", "LOCAL")
 REQUIRE_APOLLO = bool(os.environ.get("PAPOLLO_REQUIRE_APOLLO"))
+
+requires_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork()")
 
 
 class Portal:
@@ -192,3 +196,29 @@ def fake_apollo() -> FakeApollo:
     fake.publish("application", "r1", {"timeout": "30", "name": "demo"})
     fake.publish("app.json", "j1", {"content": '{"a": 1}'})
     return fake
+
+
+def run_in_child(fn: Callable[[], object], timeout: int = 10) -> object:
+    """Run ``fn`` in a forked child and return its result, or raise if it failed or hung."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover, runs in the child
+        os.close(read_fd)
+        signal.alarm(timeout)  # a deadlocked child is killed and sends nothing
+        try:
+            result: tuple[bool, object] = (True, fn())
+        except BaseException as exc:  # noqa: BLE001 reported to the parent
+            result = (False, repr(exc))
+        with os.fdopen(write_fd, "wb") as f:
+            f.write(pickle.dumps(result))
+        os._exit(0)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as f:
+        data = f.read()
+    os.waitpid(pid, 0)
+    if not data:
+        raise AssertionError("child process hung or crashed")
+    ok, value = pickle.loads(data)
+    if not ok:
+        raise AssertionError(f"child process failed: {value}")
+    return value

@@ -11,6 +11,7 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import Self
 
+from . import _fork
 from ._core import (
     DEFAULT_NAMESPACE,
     Settings,
@@ -26,7 +27,8 @@ T = TypeVar("T")
 class AsyncApollo:
     """Asyncio Apollo config client, same API as ``Apollo``.
 
-    A client instance is bound to the event loop it is first used in.
+    A client instance is bound to the event loop it is first used in. A child process created by
+    ``os.fork()`` gets a fresh connection pool and may use the client in its own event loop.
     """
 
     def __init__(
@@ -48,6 +50,7 @@ class AsyncApollo:
         self._owns_http = http_client is None
         self._snapshots: dict[str, Snapshot] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        _fork.track(self)
 
     @overload
     async def get(self, key: str, *, namespace: str = DEFAULT_NAMESPACE) -> str | None: ...
@@ -92,6 +95,13 @@ class AsyncApollo:
         tb: TracebackType | None,
     ) -> None:
         await self.aclose()
+
+    def _after_fork_in_child(self) -> None:
+        # The locks and pooled connections belong to the parent's event loop, and the sockets are
+        # shared with the parent. The old client is dropped rather than closed.
+        self._locks = {}
+        if self._owns_http:
+            self._http = httpx.AsyncClient()
 
     async def _load(self, name: str, *, only_if_missing: bool = False) -> Snapshot:
         async with self._locks.setdefault(name, asyncio.Lock()):

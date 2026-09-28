@@ -28,6 +28,11 @@ httpx connection pool, so call `close()` (or `await client.aclose()`) if you cre
 clients. Both also work as context managers. An `AsyncApollo` is bound to the event loop it
 is first used in.
 
+Clients survive `os.fork()`, so one created before gunicorn or a multiprocessing pool forks its
+workers keeps working in them. A child keeps the configs already loaded and gets a new connection
+pool, as sharing the parent's sockets would mix up responses. An `AsyncApollo` can then be used in
+the child's own event loop. An `http_client` you pass in is left alone, create it after the fork.
+
 Namespaces are fetched on first access and then served from memory. `refresh()` refetches every
 loaded namespace, and `refresh(name)` also loads a namespace that was not loaded yet, which is handy
 for failing fast at startup. Failures raise `ApolloError` and keep the previously cached config.

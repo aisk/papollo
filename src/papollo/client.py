@@ -11,6 +11,7 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import Self
 
+from . import _fork
 from ._core import (
     DEFAULT_NAMESPACE,
     Settings,
@@ -49,6 +50,7 @@ class Apollo:
         self._owns_http = http_client is None
         self._snapshots: dict[str, Snapshot] = {}
         self._locks: dict[str, threading.Lock] = {}
+        _fork.track(self)
 
     @overload
     def get(self, key: str, *, namespace: str = DEFAULT_NAMESPACE) -> str | None: ...
@@ -97,6 +99,13 @@ class Apollo:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+    def _after_fork_in_child(self) -> None:
+        # Locks may be held by threads that are gone, and the pooled sockets are shared with the
+        # parent. The old client is dropped rather than closed, closing it could block on its lock.
+        self._locks = {}
+        if self._owns_http:
+            self._http = httpx.Client()
 
     def _load(self, name: str, *, only_if_missing: bool = False) -> Snapshot:
         with self._locks.setdefault(name, threading.Lock()):

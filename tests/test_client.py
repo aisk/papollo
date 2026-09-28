@@ -7,7 +7,7 @@ import pytest
 
 from papollo import Apollo, ApolloError
 
-from .conftest import App, FakeApollo, ResponseRecorder
+from .conftest import App, FakeApollo, ResponseRecorder, requires_fork, run_in_child
 
 
 @pytest.fixture
@@ -114,6 +114,25 @@ def test_access_key(app: App) -> None:
     assert info.value.status_code == 401
 
 
+@requires_fork
+def test_fork(app: App) -> None:
+    with Apollo(app.config_url, app.app_id) as client:
+        assert client.get("timeout") == "30"
+        parent_http = client._http
+        app.publish("application", "timeout=60")
+
+        def child() -> tuple[bool, str | None, str | None]:
+            cached = client.get("timeout")
+            client.refresh()
+            return client._http is not parent_http, cached, client.get("timeout")
+
+        # A lock held by a parent thread at fork time must not deadlock the child.
+        with client._locks["application"]:
+            assert run_in_child(child) == (True, "30", "60")
+        client.refresh()
+        assert client.get("timeout") == "60"
+
+
 # The tests below need no server, or a failure a real server can not produce on demand.
 
 
@@ -192,3 +211,16 @@ def test_concurrent_first_load_fetches_once(fake_apollo: FakeApollo) -> None:
         t.join(5)
     assert results == ["30"] * 5
     assert len(fake_apollo.requests) == 1
+
+
+@requires_fork
+def test_fork_keeps_given_http_client(fake_client: Apollo) -> None:
+    fake_client.get("timeout")
+    given_http = fake_client._http
+
+    def child() -> tuple[bool, str | None]:
+        fake_client.refresh()
+        return fake_client._http is given_http, fake_client.get("timeout")
+
+    with fake_client._locks["application"]:
+        assert run_in_child(child) == (True, "30")
