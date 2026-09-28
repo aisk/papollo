@@ -25,6 +25,9 @@ _PROPERTIES_SUFFIX = ".properties"
 LONG_POLL_READ_TIMEOUT = 90.0
 _DEFAULT_TIMEOUT = 5.0  # same as httpx
 
+# A failing long poll is retried after a delay doubling from the first to the second.
+RETRY_DELAYS = (1.0, 120.0)
+
 
 @dataclass(frozen=True, slots=True)
 class Snapshot:

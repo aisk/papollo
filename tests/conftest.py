@@ -7,13 +7,16 @@ case they fail. The portal is used to create apps and publish releases.
 ``FakeApollo`` backs the few tests for failures a real server can not produce on demand.
 """
 
+import asyncio
 import json
 import os
 import pickle
 import signal
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import httpx
@@ -110,6 +113,15 @@ class App:
         return self.portal.publish(self.app_id, namespace, text, fmt)
 
 
+@contextmanager
+def portal_session() -> Iterator[Portal]:
+    with httpx.Client(base_url=PORTAL_URL) as http:
+        http.post("/signin", data={"username": PORTAL_USER, "password": PORTAL_PASSWORD})
+        if "JSESSIONID" not in http.cookies:
+            pytest.fail(f"failed to sign in to portal at {PORTAL_URL}")
+        yield Portal(http)
+
+
 @pytest.fixture(scope="session")
 def portal() -> Iterator[Portal]:
     try:
@@ -119,11 +131,8 @@ def portal() -> Iterator[Portal]:
         if REQUIRE_APOLLO:
             pytest.fail(message)
         pytest.skip(message)
-    with httpx.Client(base_url=PORTAL_URL) as http:
-        http.post("/signin", data={"username": PORTAL_USER, "password": PORTAL_PASSWORD})
-        if "JSESSIONID" not in http.cookies:
-            pytest.fail(f"failed to sign in to portal at {PORTAL_URL}")
-        yield Portal(http)
+    with portal_session() as portal:
+        yield portal
 
 
 @pytest.fixture
@@ -160,17 +169,70 @@ def recorder() -> ResponseRecorder:
 
 
 class FakeApollo:
-    """In-memory stand-in for the Apollo config service /configs endpoint."""
+    """In-memory stand-in for the Apollo config service /configs and /notifications/v2."""
+
+    # How long a long poll is held, much shorter than the real 60 seconds.
+    hold = 0.2
 
     def __init__(self) -> None:
         self.namespaces: dict[str, tuple[str, dict[str, str]]] = {}
+        self.notification_ids: dict[str, int] = {}
         self.requests: list[httpx.Request] = []
         self.fail_with: int | None = None
+        self.notifications_fail_with: int | None = None
+        self.published = threading.Condition()
 
     def publish(self, namespace: str, release_key: str, configurations: dict[str, str]) -> None:
-        self.namespaces[namespace] = (release_key, configurations)
+        with self.published:
+            self.namespaces[namespace] = (release_key, configurations)
+            self.notification_ids[namespace] = self.notification_ids.get(namespace, 0) + 1
+            self.published.notify_all()
+
+    @property
+    def config_requests(self) -> list[httpx.Request]:
+        return [r for r in self.requests if r.url.path.startswith("/configs/")]
+
+    @property
+    def poll_requests(self) -> list[httpx.Request]:
+        return [r for r in self.requests if r.url.path == "/notifications/v2"]
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/notifications/v2":
+            self.requests.append(request)
+            with self.published:
+                self.published.wait_for(lambda: bool(self._notifications(request)), self.hold)
+            return self._poll_response(request)
+        return self._config_response(request)
+
+    async def async_handler(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/notifications/v2":
+            self.requests.append(request)
+            deadline = time.monotonic() + self.hold
+            while not self._notifications(request) and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            return self._poll_response(request)
+        return self._config_response(request)
+
+    def _notifications(self, request: httpx.Request) -> list[dict[str, object]]:
+        app_id = request.url.params["appId"]
+        return [
+            {
+                "namespaceName": item["namespaceName"],
+                "notificationId": latest,
+                "messages": {"details": {f"{app_id}+default+{item['namespaceName']}": latest}},
+            }
+            for item in json.loads(request.url.params["notifications"])
+            if (latest := self.notification_ids.get(item["namespaceName"], -1))
+            > item["notificationId"]
+        ]
+
+    def _poll_response(self, request: httpx.Request) -> httpx.Response:
+        if self.notifications_fail_with is not None:
+            return httpx.Response(self.notifications_fail_with)
+        notifications = self._notifications(request)
+        return httpx.Response(200, json=notifications) if notifications else httpx.Response(304)
+
+    def _config_response(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if self.fail_with is not None:
             return httpx.Response(self.fail_with)
@@ -214,6 +276,36 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
     monkeypatch.setattr("papollo.client.monotonic", clock)
     monkeypatch.setattr("papollo.async_client.monotonic", clock)
     return clock
+
+
+def wait_until(condition: Callable[[], object], timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise TimeoutError("condition not met in time")
+        time.sleep(0.01)
+
+
+async def async_wait_until(condition: Callable[[], object], timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise TimeoutError("condition not met in time")
+        await asyncio.sleep(0.01)
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_pollers() -> Iterator[None]:
+    yield
+    leaked = [t for t in threading.enumerate() if t.name == "papollo-watch"]
+    assert not leaked, "a watching client was not closed"
+
+
+@pytest.fixture
+def fast_retry(monkeypatch: pytest.MonkeyPatch) -> tuple[float, float]:
+    delays = (0.01, 0.04)
+    monkeypatch.setattr("papollo._core.RETRY_DELAYS", delays)
+    return delays
 
 
 def run_in_child(fn: Callable[[], object], timeout: int = 10) -> object:

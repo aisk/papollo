@@ -7,8 +7,18 @@ import httpx
 import pytest
 
 from papollo import Apollo, ApolloError
+from papollo._core import parse_notifications_response
 
-from .conftest import App, Clock, FakeApollo, ResponseRecorder, requires_fork, run_in_child
+from .conftest import (
+    App,
+    Clock,
+    FakeApollo,
+    ResponseRecorder,
+    portal_session,
+    requires_fork,
+    run_in_child,
+    wait_until,
+)
 
 
 @pytest.fixture
@@ -175,6 +185,111 @@ def test_fork(app: App) -> None:
             assert run_in_child(child) == (True, "30", "60")
         client.refresh()
         assert client.get("timeout") == "60"
+
+
+def poller_alive(client: Apollo) -> bool:
+    return client._poller is not None and client._poller.is_alive()
+
+
+def wait_polling(client: Apollo, *namespaces: str) -> None:
+    """Wait until a long poll that the server holds is in flight for exactly ``namespaces``."""
+    wait_until(
+        lambda: (
+            client._poll_socket is not None
+            and client._polled == set(namespaces)
+            and all(name in client._notification_ids for name in namespaces)
+        )
+    )
+
+
+@pytest.fixture
+def watching(app: App) -> Iterator[Apollo]:
+    with Apollo(app.config_url, app.app_id, watch=True) as client:
+        yield client
+
+
+def test_watch(app: App, watching: Apollo) -> None:
+    changes: list[tuple[str, dict[str, str]]] = []
+    watching.add_listener(lambda ns, old, new: changes.append((ns, dict(new))))
+    assert watching._poller is None  # started by the first read
+    assert watching.get("timeout") == "30"
+    assert poller_alive(watching)
+    wait_polling(watching, "application")
+    app.publish("application", "timeout=60")
+    wait_until(lambda: changes)
+    assert changes == [("application", {"timeout": "60"})]
+    assert watching.get("timeout") == "60"
+
+
+def test_watch_namespace_loaded_while_polling(
+    app: App, watching: Apollo, caplog: pytest.LogCaptureFixture
+) -> None:
+    changes: list[str] = []
+    watching.add_listener(lambda ns, old, new: changes.append(ns))
+    watching.get("timeout")
+    wait_polling(watching, "application")
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        watching.namespace("app.json")
+        # The poll in flight is aborted and a new one covers both, without waiting a minute.
+        wait_polling(watching, "application", "app.json")
+    assert caplog.records == []
+    app.publish("app.json", '{"a": 2}', fmt="json")
+    wait_until(lambda: changes)
+    assert changes == ["app.json"]
+
+
+def test_close_while_polling(watching: Apollo) -> None:
+    watching.get("timeout")
+    wait_polling(watching, "application")
+    poller = watching._poller
+    started = time.monotonic()
+    watching.close()
+    assert time.monotonic() - started < 2
+    assert poller is not None and not poller.is_alive()
+    watching.get("timeout")  # still served from memory, but no new poller
+    assert watching._poller is poller
+
+
+def test_watch_access_key(app: App) -> None:
+    secret = app.portal.enable_access_key(app.app_id)
+    changed = threading.Event()
+    with Apollo(app.config_url, app.app_id, secret=secret, watch=True) as client:
+        client.add_listener(lambda ns, old, new: changed.set())
+        client.get("timeout")
+        wait_polling(client, "application")
+        app.publish("application", "timeout=60")
+        assert changed.wait(10)
+        assert client.get("timeout") == "60"
+
+
+@requires_fork
+@pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
+def test_watch_fork(app: App, watching: Apollo) -> None:
+    changes: list[str | None] = []
+    watching.add_listener(lambda ns, old, new: changes.append(new.get("timeout")))
+    watching.get("timeout")
+    wait_polling(watching, "application")
+
+    def child() -> tuple[bool, list[str | None], str | None]:
+        # The poller thread does not exist in the child, the next read starts a new one.
+        restarted = watching._poller is None
+        watching.get("timeout")
+        wait_polling(watching, "application")
+        with portal_session() as portal:
+            portal.publish(app.app_id, "application", "timeout=60")
+        wait_until(lambda: changes)
+        watching.close()
+        return restarted, changes, watching.get("timeout")
+
+    assert run_in_child(child, timeout=30) == (True, ["60"], "60")
+    # The parent kept polling on its own connection.
+    wait_until(lambda: changes)
+    assert changes == ["60"]
+
+
+def test_watch_off_by_default(client: Apollo) -> None:
+    client.get("timeout")
+    assert client._poller is None
 
 
 # The tests below need no server, or a failure a real server can not produce on demand.
@@ -363,3 +478,126 @@ def test_fork_keeps_given_http_client(fake_client: Apollo) -> None:
 
     with fake_client._locks["application"]:
         assert run_in_child(child) == (True, "30")
+
+
+@pytest.fixture
+def fake_watching(fake_apollo: FakeApollo, monkeypatch: pytest.MonkeyPatch) -> Iterator[Apollo]:
+    def create_poll_http(self: Apollo) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(fake_apollo.handler))
+
+    monkeypatch.setattr(Apollo, "_create_poll_http", create_poll_http)
+    http = httpx.Client(transport=httpx.MockTransport(fake_apollo.handler))
+    with http, Apollo("http://apollo:8080", "demo", watch=True, http_client=http) as client:
+        yield client
+
+
+def retry_delays(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage().split("retrying in ")[1].split(" ")[0]
+        for record in caplog.records
+        if record.getMessage().startswith("watch failed")
+    ]
+
+
+def test_watch_refetch_sends_messages(fake_watching: Apollo, fake_apollo: FakeApollo) -> None:
+    changed = threading.Event()
+    fake_watching.add_listener(lambda ns, old, new: changed.set())
+    fake_watching.get("timeout")
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    assert changed.wait(5)
+    assert fake_watching.get("timeout") == "60"
+    request = fake_apollo.config_requests[-1]
+    assert request.url.params["messages"] == '{"details":{"demo+default+application":2}}'
+    # Plain reads and refresh() do not send messages.
+    fake_watching.refresh()
+    assert "messages" not in fake_apollo.config_requests[-1].url.params
+
+
+@pytest.mark.usefixtures("fast_retry")
+def test_watch_backoff(
+    fake_watching: Apollo, fake_apollo: FakeApollo, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_apollo.notifications_fail_with = 500
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        fake_watching.get("timeout")
+        wait_until(lambda: len(retry_delays(caplog)) >= 4)
+        assert retry_delays(caplog)[:4] == ["0.01", "0.02", "0.04", "0.04"]
+        assert "HTTP 500" in caplog.text
+        # A successful poll resets the delay.
+        fake_apollo.notifications_fail_with = None
+        polls = len(fake_apollo.poll_requests)
+        wait_until(lambda: len(fake_apollo.poll_requests) > polls + 1)
+        caplog.clear()
+        fake_apollo.notifications_fail_with = 500
+        wait_until(lambda: retry_delays(caplog))
+        assert retry_delays(caplog)[0] == "0.01"
+        fake_watching.close()
+
+
+@pytest.mark.usefixtures("fast_retry")
+def test_watch_refetch_failure_retried(fake_watching: Apollo, fake_apollo: FakeApollo) -> None:
+    changed = threading.Event()
+    fake_watching.add_listener(lambda ns, old, new: changed.set())
+    fake_watching.get("timeout")
+    wait_until(lambda: fake_watching._notification_ids.get("application") == 1)
+    fake_apollo.fail_with = 500
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    # The notification id is kept, so the namespace is refetched again after the failure.
+    wait_until(lambda: len(fake_apollo.config_requests) >= 4)
+    assert fake_watching._notification_ids["application"] == 1
+    fake_apollo.fail_with = None
+    assert changed.wait(5)
+    assert fake_watching._notification_ids["application"] == 2
+
+
+@pytest.mark.usefixtures("fast_retry")
+def test_watch_survives_unexpected_errors(
+    fake_watching: Apollo,
+    fake_apollo: FakeApollo,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls = 0
+
+    def broken(response: httpx.Response) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("bug")
+        return parse_notifications_response(response)
+
+    monkeypatch.setattr("papollo.client.parse_notifications_response", broken)
+    changed = threading.Event()
+    fake_watching.add_listener(lambda ns, old, new: changed.set())
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        fake_watching.get("timeout")
+        wait_until(lambda: calls > 1)
+    [record] = caplog.records
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], RuntimeError)
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    assert changed.wait(5)
+
+
+def test_watch_ignores_unknown_namespaces(fake_watching: Apollo, fake_apollo: FakeApollo) -> None:
+    fake_watching.get("timeout")
+    wait_until(lambda: "application" in fake_watching._notification_ids)
+    fake_apollo.publish("app.json", "j2", {"content": "{}"})
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    wait_until(lambda: fake_watching.get("timeout") == "60")
+    assert "app.json" not in fake_watching._snapshots
+    assert all("app.json" not in r.url.path for r in fake_apollo.config_requests)
+
+
+def test_watch_starts_after_first_load(fake_watching: Apollo) -> None:
+    with pytest.raises(ApolloError):
+        fake_watching.namespace("nope")
+    assert fake_watching._poller is None
+    fake_watching.get("timeout")
+    assert poller_alive(fake_watching)
+
+
+def test_closed_client_does_not_watch(fake_watching: Apollo) -> None:
+    fake_watching.close()
+    assert fake_watching.get("timeout") == "30"
+    assert fake_watching._poller is None

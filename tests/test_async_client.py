@@ -6,8 +6,18 @@ import httpx
 import pytest
 
 from papollo import ApolloError, AsyncApollo
+from papollo._core import parse_notifications_response
 
-from .conftest import App, Clock, FakeApollo, ResponseRecorder, requires_fork, run_in_child
+from .conftest import (
+    App,
+    Clock,
+    FakeApollo,
+    ResponseRecorder,
+    async_wait_until,
+    portal_session,
+    requires_fork,
+    run_in_child,
+)
 
 
 @pytest.fixture
@@ -126,6 +136,133 @@ def test_fork(app: App) -> None:
         return await client.get("timeout")
 
     assert run_in_child(lambda: asyncio.run(refresh_and_get())) == "60"
+
+
+def poller_running(client: AsyncApollo) -> bool:
+    return client._poll_task is not None and not client._poll_task.done()
+
+
+async def wait_polling(client: AsyncApollo, *namespaces: str) -> None:
+    """Wait until a long poll that the server holds is in flight for exactly ``namespaces``."""
+    await async_wait_until(
+        lambda: (
+            client._poll_request is not None
+            and client._polled == set(namespaces)
+            and all(name in client._notification_ids for name in namespaces)
+        )
+    )
+
+
+@pytest.fixture
+async def watching(app: App) -> AsyncIterator[AsyncApollo]:
+    async with AsyncApollo(app.config_url, app.app_id, watch=True) as client:
+        yield client
+
+
+async def test_watch(app: App, watching: AsyncApollo) -> None:
+    changes: list[tuple[str, dict[str, str]]] = []
+
+    async def listener(namespace: str, old: Mapping[str, str], new: Mapping[str, str]) -> None:
+        changes.append((namespace, dict(new)))
+
+    watching.add_listener(listener)
+    assert watching._poll_task is None  # started by the first read
+    assert await watching.get("timeout") == "30"
+    assert poller_running(watching)
+    await wait_polling(watching, "application")
+    app.publish("application", "timeout=60")
+    await async_wait_until(lambda: changes)
+    assert changes == [("application", {"timeout": "60"})]
+    assert await watching.get("timeout") == "60"
+
+
+async def test_watch_namespace_loaded_while_polling(
+    app: App, watching: AsyncApollo, caplog: pytest.LogCaptureFixture
+) -> None:
+    changes: list[str] = []
+    watching.add_listener(lambda ns, old, new: changes.append(ns))
+    await watching.get("timeout")
+    await wait_polling(watching, "application")
+    task = watching._poll_task
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        await watching.namespace("app.json")
+        await wait_polling(watching, "application", "app.json")
+    assert caplog.records == []
+    assert watching._poll_task is task  # only the request was cancelled, not the poller
+    app.publish("app.json", '{"a": 2}', fmt="json")
+    await async_wait_until(lambda: changes)
+    assert changes == ["app.json"]
+
+
+async def test_aclose_while_polling(watching: AsyncApollo) -> None:
+    await watching.get("timeout")
+    await wait_polling(watching, "application")
+    task = watching._poll_task
+    started = asyncio.get_running_loop().time()
+    await watching.aclose()
+    assert asyncio.get_running_loop().time() - started < 2
+    assert task is not None and task.done()
+    await watching.get("timeout")
+    assert watching._poll_task is task
+
+
+async def test_watch_access_key(app: App) -> None:
+    secret = app.portal.enable_access_key(app.app_id)
+    changed = asyncio.Event()
+    async with AsyncApollo(app.config_url, app.app_id, secret=secret, watch=True) as client:
+        client.add_listener(lambda ns, old, new: changed.set())
+        await client.get("timeout")
+        await wait_polling(client, "application")
+        app.publish("application", "timeout=60")
+        await asyncio.wait_for(changed.wait(), 10)
+
+
+@requires_fork
+@pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
+async def test_watch_fork(app: App, watching: AsyncApollo) -> None:
+    changes: list[str | None] = []
+    watching.add_listener(lambda ns, old, new: changes.append(new.get("timeout")))
+    await watching.get("timeout")
+    await wait_polling(watching, "application")
+    parent_task = watching._poll_task
+
+    async def child() -> tuple[bool, list[str | None], str | None]:
+        # The poller task belongs to the parent's loop, the next read starts one in this loop.
+        restarted = watching._poll_task is None
+        await watching.get("timeout")
+        await wait_polling(watching, "application")
+        with portal_session() as portal:
+            portal.publish(app.app_id, "application", "timeout=60")
+        await async_wait_until(lambda: changes)
+        await watching.aclose()
+        return restarted, changes, await watching.get("timeout")
+
+    assert run_in_child(lambda: asyncio.run(child()), timeout=30) == (True, ["60"], "60")
+    # The parent kept polling on its own connection.
+    await async_wait_until(lambda: changes)
+    assert changes == ["60"]
+    assert watching._poll_task is parent_task
+
+
+def test_watch_restarts_in_new_loop(app: App) -> None:
+    client = AsyncApollo(app.config_url, app.app_id, watch=True)
+    changed: list[str] = []
+    client.add_listener(lambda ns, old, new: changed.append(ns))
+
+    async def read() -> None:
+        await client.get("timeout")
+        await wait_polling(client, "application")
+
+    asyncio.run(read())  # the poller task is cancelled when this loop ends
+
+    async def read_again() -> None:
+        await read()
+        app.publish("application", "timeout=60")
+        await async_wait_until(lambda: changed)
+        await client.aclose()
+
+    asyncio.run(read_again())
+    assert changed == ["application"]
 
 
 # The tests below need no server, or a failure a real server can not produce on demand.
@@ -251,3 +388,120 @@ async def test_listener_errors_logged(
     [record] = caplog.records
     assert record.exc_info is not None
     assert isinstance(record.exc_info[1], RuntimeError)
+
+
+@pytest.fixture
+async def fake_watching(
+    fake_apollo: FakeApollo, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[AsyncApollo]:
+    def create_poll_http(self: AsyncApollo) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(fake_apollo.async_handler))
+
+    monkeypatch.setattr(AsyncApollo, "_create_poll_http", create_poll_http)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fake_apollo.async_handler))
+    async with (
+        http,
+        AsyncApollo("http://apollo:8080", "demo", watch=True, http_client=http) as client,
+    ):
+        yield client
+
+
+def retry_delays(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage().split("retrying in ")[1].split(" ")[0]
+        for record in caplog.records
+        if record.getMessage().startswith("watch failed")
+    ]
+
+
+async def test_watch_refetch_sends_messages(
+    fake_watching: AsyncApollo, fake_apollo: FakeApollo
+) -> None:
+    changed = asyncio.Event()
+    fake_watching.add_listener(lambda ns, old, new: changed.set())
+    await fake_watching.get("timeout")
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    await asyncio.wait_for(changed.wait(), 5)
+    assert await fake_watching.get("timeout") == "60"
+    request = fake_apollo.config_requests[-1]
+    assert request.url.params["messages"] == '{"details":{"demo+default+application":2}}'
+
+
+@pytest.mark.usefixtures("fast_retry")
+async def test_watch_backoff(
+    fake_watching: AsyncApollo, fake_apollo: FakeApollo, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_apollo.notifications_fail_with = 500
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        await fake_watching.get("timeout")
+        await async_wait_until(lambda: len(retry_delays(caplog)) >= 4)
+        assert retry_delays(caplog)[:4] == ["0.01", "0.02", "0.04", "0.04"]
+        assert "HTTP 500" in caplog.text
+        fake_apollo.notifications_fail_with = None
+        polls = len(fake_apollo.poll_requests)
+        await async_wait_until(lambda: len(fake_apollo.poll_requests) > polls + 1)
+        caplog.clear()
+        fake_apollo.notifications_fail_with = 500
+        await async_wait_until(lambda: retry_delays(caplog))
+        assert retry_delays(caplog)[0] == "0.01"
+        await fake_watching.aclose()
+
+
+@pytest.mark.usefixtures("fast_retry")
+async def test_watch_survives_unexpected_errors(
+    fake_watching: AsyncApollo,
+    fake_apollo: FakeApollo,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls = 0
+
+    def broken(response: httpx.Response) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("bug")
+        return parse_notifications_response(response)
+
+    monkeypatch.setattr("papollo.async_client.parse_notifications_response", broken)
+    changed = asyncio.Event()
+    fake_watching.add_listener(lambda ns, old, new: changed.set())
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        await fake_watching.get("timeout")
+        await async_wait_until(lambda: calls > 1)
+    [record] = caplog.records
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], RuntimeError)
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    await asyncio.wait_for(changed.wait(), 5)
+
+
+@pytest.mark.usefixtures("fast_retry")
+async def test_watch_refetch_failure_retried(
+    fake_watching: AsyncApollo, fake_apollo: FakeApollo
+) -> None:
+    changed = asyncio.Event()
+    fake_watching.add_listener(lambda ns, old, new: changed.set())
+    await fake_watching.get("timeout")
+    await async_wait_until(lambda: fake_watching._notification_ids.get("application") == 1)
+    fake_apollo.fail_with = 500
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    await async_wait_until(lambda: len(fake_apollo.config_requests) >= 4)
+    assert fake_watching._notification_ids["application"] == 1
+    fake_apollo.fail_with = None
+    await asyncio.wait_for(changed.wait(), 5)
+    assert fake_watching._notification_ids["application"] == 2
+
+
+async def test_watch_starts_after_first_load(fake_watching: AsyncApollo) -> None:
+    with pytest.raises(ApolloError):
+        await fake_watching.namespace("nope")
+    assert fake_watching._poll_task is None
+    await fake_watching.get("timeout")
+    assert poller_running(fake_watching)
+
+
+async def test_closed_client_does_not_watch(fake_watching: AsyncApollo) -> None:
+    await fake_watching.aclose()
+    assert await fake_watching.get("timeout") == "30"
+    assert fake_watching._poll_task is None

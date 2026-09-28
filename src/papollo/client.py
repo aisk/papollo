@@ -1,9 +1,11 @@
+import socket
 import sys
 import threading
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from time import monotonic
 from types import TracebackType
-from typing import TypeVar, overload
+from typing import Any, TypeVar, overload
 
 import httpx
 
@@ -12,7 +14,7 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import Self
 
-from . import _fork
+from . import _core, _fork
 from ._core import (
     DEFAULT_NAMESPACE,
     Settings,
@@ -20,6 +22,7 @@ from ._core import (
     logger,
     normalize_namespace,
     parse_config_response,
+    parse_notifications_response,
 )
 from .exceptions import ApolloError
 
@@ -28,13 +31,17 @@ T = TypeVar("T")
 Listener = Callable[[str, Mapping[str, str], Mapping[str, str]], None]
 L = TypeVar("L", bound=Listener)
 
+# httpcore trace events returning the network stream a request is sent over.
+_STREAM_EVENTS = (".connect_tcp.complete", ".connect_unix_socket.complete", ".start_tls.complete")
+
 
 class Apollo:
     """Blocking Apollo config client.
 
     Namespaces are fetched on first access and then served from memory. Call ``refresh()`` to
-    pull the latest release, or set ``max_age`` to have a read refetch a namespace once its
-    cached config is older than that many seconds.
+    pull the latest release, set ``max_age`` to have a read refetch a namespace once its cached
+    config is older than that many seconds, or set ``watch`` to have a background thread long
+    poll the server and refetch namespaces as soon as they are released.
     """
 
     def __init__(
@@ -48,6 +55,7 @@ class Apollo:
         label: str | None = None,
         timeout: float | None = None,
         max_age: float | None = None,
+        watch: bool = False,
         http_client: httpx.Client | None = None,
     ) -> None:
         self._settings = Settings(
@@ -60,7 +68,21 @@ class Apollo:
         self._fetched_at: dict[str, float] = {}
         self._listeners: tuple[Listener, ...] = ()
         self._locks: dict[str, threading.Lock] = {}
+        self._watch = watch
+        self._notification_ids: dict[str, int] = {}
+        self._closed = False
+        self._init_poller()
         _fork.track(self)
+
+    def _init_poller(self) -> None:
+        # The poller thread is started by the first read, not here, so a client created in a
+        # process that forks before reading does not run a thread the children would not have.
+        self._poller: threading.Thread | None = None
+        self._stop = threading.Event()
+        # Guards the socket of the long poll in flight and the namespaces it covers.
+        self._poll_lock = threading.Lock()
+        self._poll_socket: socket.socket | None = None
+        self._polled: frozenset[str] = frozenset()
 
     @overload
     def get(self, key: str, *, namespace: str = DEFAULT_NAMESPACE) -> str | None: ...
@@ -78,6 +100,7 @@ class Apollo:
             snapshot = self._load(name, only_if_missing=True)
         elif self._is_stale(name):
             snapshot = self._refresh_stale(name, snapshot)
+        self._ensure_watching()
         return snapshot.configurations
 
     def refresh(self, name: str | None = None) -> None:
@@ -94,6 +117,7 @@ class Apollo:
                 self._load(ns)
             except Exception as exc:  # noqa: BLE001 raised below after all were tried
                 error = error or exc
+        self._ensure_watching()
         if error is not None:
             raise error
 
@@ -112,6 +136,15 @@ class Apollo:
         self._listeners = tuple(cb for cb in self._listeners if cb != callback)
 
     def close(self) -> None:
+        with self._poll_lock:
+            self._closed = True
+            self._stop.set()
+            poller = self._poller
+            # Closing the httpx client would not wake up a thread blocked reading the socket.
+            if self._poll_socket is not None:
+                _shutdown(self._poll_socket)
+        if poller is not None and poller is not threading.current_thread():
+            poller.join()
         if self._owns_http:
             self._http.close()
 
@@ -132,6 +165,9 @@ class Apollo:
         self._locks = {}
         if self._owns_http:
             self._http = httpx.Client()
+        # The poller thread does not exist in the child, the next read starts a new one. The
+        # socket of its long poll is shared with the parent and must not be shut down here.
+        self._init_poller()
 
     def _is_stale(self, name: str) -> bool:
         return self._max_age is not None and monotonic() - self._fetched_at[name] >= self._max_age
@@ -155,12 +191,20 @@ class Apollo:
         self._emit(name, before, snapshot)
         return snapshot
 
-    def _load(self, name: str, *, only_if_missing: bool = False) -> Snapshot:
+    def _load(
+        self,
+        name: str,
+        *,
+        only_if_missing: bool = False,
+        messages: Mapping[str, int] | None = None,
+    ) -> Snapshot:
         with self._locks.setdefault(name, threading.Lock()):
             before = self._snapshots.get(name)
             if only_if_missing and before is not None:
                 return before
-            snapshot = self._fetch(name)
+            snapshot = self._fetch(name, messages)
+        if before is None:
+            self._watch_new_namespace(name)
         self._emit(name, before, snapshot)
         return snapshot
 
@@ -174,14 +218,14 @@ class Apollo:
             except Exception:  # noqa: BLE001 a broken listener must not break the fetch
                 logger.exception("config change listener %r failed", callback)
 
-    def _fetch(self, name: str) -> Snapshot:
+    def _fetch(self, name: str, messages: Mapping[str, int] | None = None) -> Snapshot:
         """Fetch a namespace, the caller must hold its lock."""
         current = self._snapshots.get(name)
         release_key = current.release_key if current is not None else None
         # Set before the request, so a failing server is retried once per max_age at most.
         self._fetched_at[name] = monotonic()
         try:
-            request = self._settings.build_config_request(self._http, name, release_key)
+            request = self._settings.build_config_request(self._http, name, release_key, messages)
             response = self._http.send(request)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise ApolloError(f"failed to fetch namespace {name!r}: {exc}") from exc
@@ -194,3 +238,92 @@ class Apollo:
             return current
         self._snapshots[name] = snapshot
         return snapshot
+
+    def _ensure_watching(self) -> None:
+        if not self._watch or self._poller is not None or not self._snapshots:
+            return
+        with self._poll_lock:
+            if self._poller is None and not self._closed:
+                self._poller = threading.Thread(
+                    target=self._poll_forever, name="papollo-watch", daemon=True
+                )
+                self._poller.start()
+
+    def _watch_new_namespace(self, name: str) -> None:
+        # A long poll in flight does not cover a namespace loaded meanwhile. Abort it rather than
+        # waiting up to 60 seconds for its answer, the poller then starts one covering both.
+        with self._poll_lock:
+            if self._poll_socket is not None and name not in self._polled:
+                _shutdown(self._poll_socket)
+
+    def _trace(self, event: str, info: Mapping[str, Any]) -> None:
+        if not event.endswith(_STREAM_EVENTS):
+            return
+        sock = info["return_value"].get_extra_info("socket")
+        with self._poll_lock:
+            self._poll_socket = sock
+            # close() or a new namespace may have come before the socket was known.
+            if sock is not None and (self._stop.is_set() or self._has_unpolled_namespace()):
+                _shutdown(sock)
+
+    def _has_unpolled_namespace(self) -> bool:
+        return not self._polled.issuperset(list(self._snapshots))
+
+    def _poll_forever(self) -> None:
+        delay = _core.RETRY_DELAYS[0]
+        with self._create_poll_http() as http:
+            while not self._stop.is_set():
+                try:
+                    self._poll(http)
+                except Exception as exc:  # noqa: BLE001 the poller must keep running
+                    if self._stop.is_set():
+                        break
+                    if isinstance(exc, ApolloError):
+                        logger.warning("watch failed, retrying in %g seconds: %s", delay, exc)
+                    else:
+                        logger.exception("watch failed, retrying in %g seconds", delay)
+                    self._stop.wait(delay)
+                    delay = min(delay * 2, _core.RETRY_DELAYS[1])
+                else:
+                    delay = _core.RETRY_DELAYS[0]
+
+    def _create_poll_http(self) -> httpx.Client:
+        # A separate client, a pooled connection of the user's own would be held for a minute.
+        # Keep-alive is off so every long poll has its own socket, see _trace().
+        return httpx.Client(limits=httpx.Limits(max_keepalive_connections=0))
+
+    def _poll(self, http: httpx.Client) -> None:
+        with self._poll_lock:
+            ids = {name: self._notification_ids.get(name, -1) for name in list(self._snapshots)}
+            self._polled = frozenset(ids)
+        try:
+            request = self._settings.build_notifications_request(http, ids)
+            request.extensions["trace"] = self._trace
+            response = http.send(request)
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            if self._stop.is_set() or self._has_unpolled_namespace():
+                return  # aborted on purpose
+            raise ApolloError(f"failed to poll notifications: {exc}") from exc
+        finally:
+            with self._poll_lock:
+                self._poll_socket = None
+        error: ApolloError | None = None
+        for notification in parse_notifications_response(response):
+            name = notification.namespace
+            if name not in ids:
+                continue
+            try:
+                self._load(name, messages=notification.messages)
+            except ApolloError as exc:
+                # The id is not updated, so the next poll reports the namespace again.
+                error = error or exc
+            else:
+                self._notification_ids[name] = notification.notification_id
+        if error is not None:
+            raise error
+
+
+def _shutdown(sock: socket.socket) -> None:
+    # Unlike close(), this wakes up a thread blocked reading the socket.
+    with suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
