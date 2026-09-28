@@ -81,6 +81,18 @@ class Portal:
         )
         return str(release.json()["releaseKey"])
 
+    def wait_for_admin_service(self, timeout: float = 60) -> None:
+        """Wait until the portal can reach the admin service, which registers after startup.
+
+        Until then the portal answers 500 to anything the admin service handles, and an app
+        created meanwhile is never synced to it.
+        """
+        deadline = time.monotonic() + timeout
+        while self.http.get(f"/apps/papollo-probe/envs/{ENV}/clusters/default").status_code >= 500:
+            if time.monotonic() > deadline:
+                raise TimeoutError("the portal did not reach the admin service in time")
+            time.sleep(1)
+
     def enable_access_key(self, app_id: str) -> str:
         base = f"/apps/{app_id}/envs/{ENV}/accesskeys"
         key = self._call(
@@ -137,6 +149,7 @@ def portal() -> Iterator[Portal]:
             pytest.fail(message)
         pytest.skip(message)
     with portal_session() as portal:
+        portal.wait_for_admin_service()
         yield portal
 
 
