@@ -10,7 +10,8 @@ import httpx
 import pytest
 
 from papollo import Apollo, ApolloError
-from papollo._core import parse_cache, parse_notifications_response
+from papollo._cache import LocalCache
+from papollo._core import Snapshot, parse_cache, parse_notifications_response
 
 from .conftest import (
     App,
@@ -683,6 +684,40 @@ def test_cache_not_served_for_bad_url(tmp_path: Path) -> None:
     # A server URL without a scheme will never work, the cache must not hide that.
     with Apollo("apollo:8080", "demo", cache_dir=tmp_path) as client, pytest.raises(ApolloError):
         client.get("timeout")
+
+
+def test_cache_concurrent_first_loads(
+    fake_apollo: FakeApollo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def slow_handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.05)  # let the other readers pile up on the namespace lock
+        return fake_apollo.handler(request)
+
+    loads: list[str] = []
+    load = LocalCache.load
+
+    def counting_load(self: LocalCache, namespace: str) -> Snapshot | None:
+        loads.append(namespace)
+        return load(self, namespace)
+
+    monkeypatch.setattr(LocalCache, "load", counting_load)
+    write_cache(tmp_path, "application", "r0", {"timeout": "10"})
+    fake_apollo.fail_with = 500
+    results: list[str | None] = []
+    with (
+        httpx.Client(transport=httpx.MockTransport(slow_handler)) as http,
+        Apollo("http://apollo:8080", "demo", cache_dir=tmp_path, http_client=http) as client,
+    ):
+        threads = [
+            threading.Thread(target=lambda: results.append(client.get("timeout"))) for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert results == ["10"] * 8
+    assert len(fake_apollo.requests) == 1
+    assert loads == ["application"]
 
 
 def test_cache_refresh_raises_but_serves(
