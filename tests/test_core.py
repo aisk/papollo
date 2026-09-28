@@ -144,6 +144,7 @@ def test_parse_not_modified() -> None:
         httpx.Response(500),
         httpx.Response(200, content=b"not json"),
         httpx.Response(200, json={"releaseKey": "r1"}),
+        pytest.param(httpx.Response(200, content=b"[" * 100_000), id="deeply nested"),
     ],
 )
 def test_parse_errors(response: httpx.Response) -> None:
@@ -182,6 +183,7 @@ def test_parse_notifications_not_modified() -> None:
         httpx.Response(200, json={"namespaceName": "application"}),
         httpx.Response(200, json=[{"namespaceName": "application"}]),
         httpx.Response(200, json=[{"namespaceName": "a", "notificationId": 1, "messages": 1}]),
+        pytest.param(httpx.Response(200, content=b"[" * 100_000), id="deeply nested"),
     ],
 )
 def test_parse_notifications_errors(response: httpx.Response) -> None:
@@ -254,6 +256,8 @@ def test_cache_round_trip() -> None:
         b'{"format": 1, "releaseKey": "r1", "configurations": 1}',
         b'{"format": 1, "releaseKey": 1, "configurations": {}}',
         b'{"format": 1, "releaseKey": "r1", "configurations": {"k": 1}}',
+        b'{"format": 1, "releaseKey": "r1", "configurations": [["k", "v"]]}',
+        pytest.param(b"[" * 100_000, id="deeply nested"),
     ],
 )
 def test_parse_cache_errors(data: bytes) -> None:

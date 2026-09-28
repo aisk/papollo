@@ -140,7 +140,7 @@ def parse_config_response(response: httpx.Response, namespace: str) -> Snapshot 
         body = response.json()
         release_key = body["releaseKey"]
         configurations = dict(body["configurations"])
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, RecursionError) as exc:
         raise ApolloError(
             f"invalid response for namespace {namespace!r}", status_code=response.status_code
         ) from exc
@@ -173,7 +173,7 @@ def parse_notifications_response(response: httpx.Response) -> list[Notification]
             )
             for item in response.json()
         ]
-    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
         raise ApolloError(
             "invalid notifications response", status_code=response.status_code
         ) from exc
@@ -221,11 +221,15 @@ def parse_cache(data: bytes) -> Snapshot:
         if body["format"] != _CACHE_FORMAT:
             raise ValueError(f"unsupported format {body['format']!r}")
         release_key = body["releaseKey"]
-        configurations = dict(body["configurations"])
-    except (KeyError, TypeError) as exc:
+        configurations = body["configurations"]
+    except (KeyError, TypeError, RecursionError) as exc:
         raise ValueError(f"invalid config cache: {exc!r}") from exc
-    if not isinstance(release_key, str) or not all(
-        isinstance(key, str) and isinstance(value, str) for key, value in configurations.items()
+    if (
+        not isinstance(release_key, str)
+        or not isinstance(configurations, dict)
+        or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in configurations.items()
+        )
     ):
-        raise ValueError("invalid config cache: not a string")
+        raise ValueError("invalid config cache: unexpected type")
     return Snapshot(release_key, MappingProxyType(configurations))
