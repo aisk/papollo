@@ -16,7 +16,7 @@ class LocalCache:
 
     def __init__(self, directory: str | os.PathLike[str], app_id: str, cluster: str) -> None:
         # Absolute, so a later chdir() does not move the cache.
-        self.directory = os.path.abspath(directory)
+        self.directory = os.path.abspath(os.path.expanduser(directory))
         self._app_id = app_id
         self._cluster = cluster
 

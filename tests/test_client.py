@@ -870,3 +870,8 @@ def test_cache_fd_closed_when_fdopen_fails(
     with pytest.raises(OSError):
         os.fstat(fd)
     assert os.listdir(tmp_path) == []
+
+
+def test_cache_dir_expands_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert LocalCache("~/cache", "demo", "default").directory == str(tmp_path / "cache")
