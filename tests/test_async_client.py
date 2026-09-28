@@ -326,6 +326,29 @@ async def test_owned_http_client_closed() -> None:
     assert client._http.is_closed
 
 
+async def test_invalid_url_wrapped() -> None:
+    async with AsyncApollo("http://[bad", "demo") as client:
+        with pytest.raises(ApolloError):
+            await client.get("timeout")
+
+
+async def test_given_http_client_not_closed() -> None:
+    async with httpx.AsyncClient() as http:
+        await AsyncApollo("http://apollo:8080", "demo", http_client=http).aclose()
+        assert not http.is_closed
+
+
+async def test_failed_first_load_not_cached(
+    fake_client: AsyncApollo, fake_apollo: FakeApollo
+) -> None:
+    fake_apollo.fail_with = 500
+    with pytest.raises(ApolloError):
+        await fake_client.refresh("application")
+    fake_apollo.fail_with = None
+    assert await fake_client.get("timeout") == "30"
+    assert len(fake_apollo.requests) == 2
+
+
 @pytest.fixture
 async def fake_client(fake_apollo: FakeApollo) -> AsyncIterator[AsyncApollo]:
     async with (
