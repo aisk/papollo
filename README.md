@@ -81,15 +81,16 @@ master process.
 To start while the config service is down, set `cache_dir`, like the Java client's local cache.
 Every new release fetched is also written to `{app_id}+{cluster}+{namespace}.json` in that
 directory, which is created if missing. Files are replaced atomically, so processes can share a
-directory, and are only readable by their owner as configs may hold secrets. When a namespace fails
-to load because the server is unreachable or answers with a 5xx, a read serves the cached file
-instead and logs a warning. Errors such as a wrong `secret`, an unknown namespace or a server URL
-without `http://` are raised as usual, a stale cache would only hide them. `refresh(name)` loads the
-cached file too but still raises, so a fail fast check at startup notices, and reads after it are
-served from the cache. From then on the namespace counts as loaded with the cached release, which
-`refresh()`, `max_age` or `watch` refetch like any other, and listeners are called when the server
-has a newer one. A cache file that can not be read is ignored and failing to write one never fails a
-fetch, both are logged as warnings.
+directory, and on Unix are only readable by their owner as configs may hold secrets. File names do
+not include the server URL, `ip` or `label`, so clients of different environments or gray releases
+should use separate directories. When a namespace fails to load because the server is unreachable or
+answers with a 5xx, a read serves the cached file instead and logs a warning. Errors such as a wrong
+`secret`, an unknown namespace or a server URL without `http://` are raised as usual, a stale cache
+would only hide them. `refresh(name)` loads the cached file too but still raises, so a fail fast
+check at startup notices, and reads after it are served from the cache. From then on the namespace
+counts as loaded with the cached release, which `refresh()`, `max_age` or `watch` refetch like any
+other, and listeners are called when the server has a newer one. A cache file that can not be read
+is ignored and failing to write one never fails a fetch, both are logged as warnings.
 
 Other options: `cluster`, `secret` (access key), `ip` and `label` (gray release), `timeout`, and
 `http_client` to bring your own `httpx.Client` / `httpx.AsyncClient`. When `timeout` is not set, the

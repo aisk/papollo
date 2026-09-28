@@ -259,8 +259,9 @@ class AsyncApollo:
                 )
             return current
         if self._cache is not None:
-            # Tiny files, but a slow disk or network mount must not block the loop, and this
-            # only runs for new releases. Written first, as a cancelled task then stores nothing.
+            # Tiny files, but a slow disk or network mount must not block the loop. Saved before
+            # memory is updated, so a task cancelled here fetches the release again later, rather
+            # than leaving the file behind for good as a 304 never rewrites it.
             await asyncio.to_thread(self._cache.save, name, snapshot)
         self._snapshots[name] = snapshot
         return snapshot
