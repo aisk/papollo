@@ -5,52 +5,52 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
-from papollo import ApolloClient, ApolloError
+from papollo import Apollo, ApolloError
 
 from .conftest import App, FakeApollo, ResponseRecorder
 
 
 @pytest.fixture
-def client(app: App, recorder: ResponseRecorder) -> Iterator[ApolloClient]:
+def client(app: App, recorder: ResponseRecorder) -> Iterator[Apollo]:
     with (
         httpx.Client(event_hooks={"response": [recorder]}) as http,
-        ApolloClient(app.config_url, app.app_id, http_client=http) as client,
+        Apollo(app.config_url, app.app_id, http_client=http) as client,
     ):
         yield client
 
 
-def test_get(client: ApolloClient) -> None:
+def test_get(client: Apollo) -> None:
     assert client.get("timeout") == "30"
     assert client.get("name") == "demo"
     assert client.get("missing") is None
     assert client.get("missing", "1") == "1"
 
 
-def test_non_properties_namespace(client: ApolloClient) -> None:
+def test_non_properties_namespace(client: Apollo) -> None:
     assert client.namespace("app.json") == {"content": '{"a": 1}'}
 
 
-def test_properties_suffix(client: ApolloClient, recorder: ResponseRecorder) -> None:
+def test_properties_suffix(client: Apollo, recorder: ResponseRecorder) -> None:
     assert client.get("timeout", namespace="application.properties") == "30"
     assert client.namespace("application") is client.namespace("application.properties")
     assert recorder.statuses == [200]
 
 
-def test_cached_after_first_load(client: ApolloClient, recorder: ResponseRecorder) -> None:
+def test_cached_after_first_load(client: Apollo, recorder: ResponseRecorder) -> None:
     client.get("timeout")
     client.get("name")
     client.namespace()
     assert recorder.statuses == [200]
 
 
-def test_refresh_not_modified(client: ApolloClient, recorder: ResponseRecorder) -> None:
+def test_refresh_not_modified(client: Apollo, recorder: ResponseRecorder) -> None:
     before = client.namespace()
     client.refresh()
     assert recorder.statuses == [200, 304]
     assert client.namespace() is before
 
 
-def test_refresh_new_release(app: App, client: ApolloClient) -> None:
+def test_refresh_new_release(app: App, client: Apollo) -> None:
     before = client.namespace()
     app.publish("application", "timeout=60")
     client.refresh()
@@ -59,18 +59,18 @@ def test_refresh_new_release(app: App, client: ApolloClient) -> None:
     assert before["timeout"] == "30"
 
 
-def test_namespace_is_read_only(client: ApolloClient) -> None:
+def test_namespace_is_read_only(client: Apollo) -> None:
     with pytest.raises(TypeError):
         client.namespace()["timeout"] = "1"  # type: ignore[index]
 
 
-def test_refresh_loads_unloaded_namespace(client: ApolloClient, recorder: ResponseRecorder) -> None:
+def test_refresh_loads_unloaded_namespace(client: Apollo, recorder: ResponseRecorder) -> None:
     client.refresh("app.json")
     client.namespace("app.json")
     assert recorder.statuses == [200]
 
 
-def test_refresh_all_only_touches_loaded(client: ApolloClient, recorder: ResponseRecorder) -> None:
+def test_refresh_all_only_touches_loaded(client: Apollo, recorder: ResponseRecorder) -> None:
     client.refresh()
     assert recorder.statuses == []
     client.namespace()
@@ -78,7 +78,7 @@ def test_refresh_all_only_touches_loaded(client: ApolloClient, recorder: Respons
     assert recorder.statuses == [200, 304]
 
 
-def test_missing_namespace(client: ApolloClient) -> None:
+def test_missing_namespace(client: Apollo) -> None:
     with pytest.raises(ApolloError) as info:
         client.namespace("nope")
     assert info.value.status_code == 404
@@ -87,7 +87,7 @@ def test_missing_namespace(client: ApolloClient) -> None:
 def test_options_sent_on_wire(app: App, recorder: ResponseRecorder) -> None:
     with (
         httpx.Client(event_hooks={"response": [recorder]}) as http,
-        ApolloClient(
+        Apollo(
             app.config_url, app.app_id, cluster="sh", ip="10.0.0.1", label="gray", http_client=http
         ) as client,
     ):
@@ -101,13 +101,13 @@ def test_options_sent_on_wire(app: App, recorder: ResponseRecorder) -> None:
 
 def test_access_key(app: App) -> None:
     secret = app.portal.enable_access_key(app.app_id)
-    with ApolloClient(app.config_url, app.app_id, secret=secret) as client:
+    with Apollo(app.config_url, app.app_id, secret=secret) as client:
         assert client.get("timeout") == "30"
-    with ApolloClient(app.config_url, app.app_id) as client, pytest.raises(ApolloError) as info:
+    with Apollo(app.config_url, app.app_id) as client, pytest.raises(ApolloError) as info:
         client.get("timeout")
     assert info.value.status_code == 401
     with (
-        ApolloClient(app.config_url, app.app_id, secret="wrong") as client,
+        Apollo(app.config_url, app.app_id, secret="wrong") as client,
         pytest.raises(ApolloError) as info,
     ):
         client.get("timeout")
@@ -118,38 +118,38 @@ def test_access_key(app: App) -> None:
 
 
 def test_network_error_wrapped() -> None:
-    with ApolloClient("http://127.0.0.1:1", "demo") as client, pytest.raises(ApolloError) as info:
+    with Apollo("http://127.0.0.1:1", "demo") as client, pytest.raises(ApolloError) as info:
         client.get("timeout")
     assert isinstance(info.value.__cause__, httpx.ConnectError)
 
 
 def test_invalid_url_wrapped() -> None:
-    with ApolloClient("http://[bad", "demo") as client, pytest.raises(ApolloError):
+    with Apollo("http://[bad", "demo") as client, pytest.raises(ApolloError):
         client.get("timeout")
 
 
 def test_owned_http_client_closed() -> None:
-    client = ApolloClient("http://apollo:8080", "demo")
+    client = Apollo("http://apollo:8080", "demo")
     client.close()
     assert client._http.is_closed
 
 
 def test_given_http_client_not_closed() -> None:
     with httpx.Client() as http:
-        ApolloClient("http://apollo:8080", "demo", http_client=http).close()
+        Apollo("http://apollo:8080", "demo", http_client=http).close()
         assert not http.is_closed
 
 
 @pytest.fixture
-def fake_client(fake_apollo: FakeApollo) -> Iterator[ApolloClient]:
+def fake_client(fake_apollo: FakeApollo) -> Iterator[Apollo]:
     with (
         httpx.Client(transport=httpx.MockTransport(fake_apollo.handler)) as http,
-        ApolloClient("http://apollo:8080", "demo", http_client=http) as client,
+        Apollo("http://apollo:8080", "demo", http_client=http) as client,
     ):
         yield client
 
 
-def test_refresh_failure_keeps_cache(fake_client: ApolloClient, fake_apollo: FakeApollo) -> None:
+def test_refresh_failure_keeps_cache(fake_client: Apollo, fake_apollo: FakeApollo) -> None:
     fake_client.namespace()
     fake_client.namespace("app.json")
     fake_apollo.fail_with = 500
@@ -159,7 +159,7 @@ def test_refresh_failure_keeps_cache(fake_client: ApolloClient, fake_apollo: Fak
     assert fake_client.get("timeout") == "30"
 
 
-def test_failed_first_load_not_cached(fake_client: ApolloClient, fake_apollo: FakeApollo) -> None:
+def test_failed_first_load_not_cached(fake_client: Apollo, fake_apollo: FakeApollo) -> None:
     fake_apollo.fail_with = 500
     with pytest.raises(ApolloError):
         fake_client.refresh("application")
@@ -178,7 +178,7 @@ def test_concurrent_first_load_fetches_once(fake_apollo: FakeApollo) -> None:
         return fake_apollo.handler(request)
 
     http = httpx.Client(transport=httpx.MockTransport(slow_handler))
-    client = ApolloClient("http://apollo:8080", "demo", http_client=http)
+    client = Apollo("http://apollo:8080", "demo", http_client=http)
     results: list[str | None] = []
     threads = [
         threading.Thread(target=lambda: results.append(client.get("timeout"))) for _ in range(5)

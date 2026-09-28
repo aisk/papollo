@@ -15,8 +15,8 @@ from ._core import (
 from .exceptions import ApolloError
 
 
-class AsyncApolloClient:
-    """Asyncio Apollo config client, same API as ``ApolloClient``.
+class AsyncApollo:
+    """Asyncio Apollo config client, same API as ``Apollo``.
 
     A client instance is bound to the event loop it is first used in.
     """

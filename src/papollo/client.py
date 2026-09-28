@@ -15,7 +15,7 @@ from ._core import (
 from .exceptions import ApolloError
 
 
-class ApolloClient:
+class Apollo:
     """Blocking Apollo config client.
 
     Namespaces are fetched on first access and then served from memory.

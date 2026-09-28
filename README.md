@@ -3,9 +3,9 @@
 Python client for [Apollo](https://github.com/apolloconfig/apollo) config center, with sync and async support.
 
 ```python
-from papollo import ApolloClient
+from papollo import Apollo
 
-client = ApolloClient("http://apollo-config:8080", "demo-app")
+client = Apollo("http://apollo-config:8080", "demo-app")
 
 client.get("timeout")                          # "30", or None if missing
 client.get("timeout", "10")                    # with default
@@ -15,9 +15,9 @@ client.refresh()                               # pull latest releases
 ```
 
 ```python
-from papollo import AsyncApolloClient
+from papollo import AsyncApollo
 
-client = AsyncApolloClient("http://apollo-config:8080", "demo-app")
+client = AsyncApollo("http://apollo-config:8080", "demo-app")
 
 await client.get("timeout")
 await client.refresh()
@@ -25,7 +25,7 @@ await client.refresh()
 
 A client is meant to live as long as the process, usually as a module level object. It holds an
 httpx connection pool, so call `close()` (or `await client.aclose()`) if you create short lived
-clients. Both also work as context managers. An `AsyncApolloClient` is bound to the event loop it
+clients. Both also work as context managers. An `AsyncApollo` is bound to the event loop it
 is first used in.
 
 Namespaces are fetched on first access and then served from memory. `refresh()` refetches every
