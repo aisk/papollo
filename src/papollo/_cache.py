@@ -48,7 +48,12 @@ class LocalCache:
         # writers and readers never see a partial file. mkstemp() creates it 0o600.
         fd, tmp = tempfile.mkstemp(dir=self.directory, prefix=".papollo-", suffix=".tmp")
         try:
-            with os.fdopen(fd, "wb") as f:
+            try:
+                f = os.fdopen(fd, "wb")
+            except BaseException:
+                os.close(fd)
+                raise
+            with f:
                 f.write(data)
             os.replace(tmp, path)
         except BaseException:

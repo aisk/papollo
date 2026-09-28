@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -844,3 +845,28 @@ def test_cache_watch_catches_up(
         fake_apollo.fail_with = None
         wait_until(lambda: client.get("timeout") == "60")
     assert parse_cache(path.read_bytes()).release_key == "r2"
+
+
+def test_cache_fd_closed_when_fdopen_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    fds: list[int] = []
+    mkstemp = tempfile.mkstemp
+
+    def recording_mkstemp(**kwargs: str) -> tuple[int, str]:
+        fd, path = mkstemp(**kwargs)
+        fds.append(fd)
+        return fd, path
+
+    def broken_fdopen(fd: int, mode: str) -> object:
+        raise OSError("fdopen failed")
+
+    monkeypatch.setattr(tempfile, "mkstemp", recording_mkstemp)
+    monkeypatch.setattr(os, "fdopen", broken_fdopen)
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        write_cache(tmp_path, "application", "r1", {"k": "v"})
+    assert "fdopen failed" in caplog.text
+    [fd] = fds
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    assert os.listdir(tmp_path) == []
