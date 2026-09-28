@@ -243,10 +243,13 @@ class AsyncApollo:
     async def _poll_forever(self) -> None:
         delay = _core.RETRY_DELAYS[0]
         async with self._create_poll_http() as http:
-            while True:
+            # Checked as aclose() does not cancel the poller when a listener calls it from here.
+            while not self._closed:
                 try:
                     await self._poll(http)
                 except Exception as exc:  # noqa: BLE001 the poller must keep running
+                    if self._closed:
+                        break
                     if isinstance(exc, ApolloError):
                         logger.warning("watch failed, retrying in %g seconds: %s", delay, exc)
                     else:

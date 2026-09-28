@@ -601,3 +601,11 @@ def test_closed_client_does_not_watch(fake_watching: Apollo) -> None:
     fake_watching.close()
     assert fake_watching.get("timeout") == "30"
     assert fake_watching._poller is None
+
+
+def test_close_in_listener_stops_watch(fake_watching: Apollo, fake_apollo: FakeApollo) -> None:
+    fake_watching.add_listener(lambda ns, old, new: fake_watching.close())
+    fake_watching.get("timeout")
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    # Called in the poller thread, which then stops.
+    wait_until(lambda: not poller_alive(fake_watching))

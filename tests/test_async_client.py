@@ -505,3 +505,18 @@ async def test_closed_client_does_not_watch(fake_watching: AsyncApollo) -> None:
     await fake_watching.aclose()
     assert await fake_watching.get("timeout") == "30"
     assert fake_watching._poll_task is None
+
+
+async def test_aclose_in_listener_stops_watch(
+    fake_watching: AsyncApollo, fake_apollo: FakeApollo
+) -> None:
+    async def listener(namespace: str, old: object, new: object) -> None:
+        await fake_watching.aclose()
+
+    fake_watching.add_listener(listener)
+    await fake_watching.get("timeout")
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    # Called in the poller task, which then stops instead of polling a closed client forever.
+    await async_wait_until(
+        lambda: fake_watching._poll_task is not None and fake_watching._poll_task.done()
+    )
