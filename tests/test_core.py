@@ -5,7 +5,14 @@ import httpx
 import pytest
 
 from papollo import ApolloError
-from papollo._core import Settings, normalize_namespace, parse_config_response, sign
+from papollo._core import (
+    Notification,
+    Settings,
+    normalize_namespace,
+    parse_config_response,
+    parse_notifications_response,
+    sign,
+)
 
 
 def make_settings(**overrides: Any) -> Settings:
@@ -67,6 +74,47 @@ def test_request_signed(monkeypatch: pytest.MonkeyPatch) -> None:
     assert request.headers["Authorization"] == "Apollo 100004458:EoKyziXvKqzHgwx+ijDJwgVTDgE="
 
 
+def test_request_messages() -> None:
+    with httpx.Client() as http:
+        request = make_settings().build_config_request(
+            http, "application", "r1", {"demo+default+application": 7}
+        )
+    assert request.url.params["messages"] == '{"details":{"demo+default+application":7}}'
+
+
+def test_notifications_request() -> None:
+    settings = make_settings(ip="10.0.0.1")
+    with httpx.Client() as http:
+        request = settings.build_notifications_request(http, {"application": -1, "app.json": 3})
+    assert request.url.path == "/notifications/v2"
+    assert dict(request.url.params) == {
+        "appId": "demo",
+        "cluster": "default",
+        "notifications": '[{"namespaceName":"application","notificationId":-1},'
+        '{"namespaceName":"app.json","notificationId":3}]',
+        "ip": "10.0.0.1",
+    }
+    # The server holds the request for 60 seconds.
+    assert request.extensions["timeout"] == {
+        "connect": 5.0,
+        "read": 90.0,
+        "write": 5.0,
+        "pool": 5.0,
+    }
+
+
+def test_notifications_request_signed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("time.time", lambda: 1576478257.344)
+    settings = make_settings(secret="df23df3f59884980844ff3dada30fa97")
+    with httpx.Client() as http:
+        request = settings.build_notifications_request(http, {"application": -1})
+    path = request.url.raw_path.decode()
+    assert request.headers["Timestamp"] == "1576478257344"
+    assert request.headers["Authorization"] == (
+        f"Apollo demo:{sign('1576478257344', path, 'df23df3f59884980844ff3dada30fa97')}"
+    )
+
+
 def test_parse_ok() -> None:
     response = httpx.Response(200, json={"configurations": {"k": "v"}, "releaseKey": "r1"})
     snapshot = parse_config_response(response, "application")
@@ -94,4 +142,42 @@ def test_parse_not_modified() -> None:
 def test_parse_errors(response: httpx.Response) -> None:
     with pytest.raises(ApolloError) as info:
         parse_config_response(response, "application")
+    assert info.value.status_code == response.status_code
+
+
+def test_parse_notifications() -> None:
+    body = [
+        {
+            "namespaceName": "application",
+            "notificationId": 12,
+            "messages": {"details": {"demo+default+application": 12}},
+        },
+        {"namespaceName": "app.json", "notificationId": 3, "messages": None},
+        {"namespaceName": "other", "notificationId": 4},
+    ]
+    assert parse_notifications_response(httpx.Response(200, json=body)) == [
+        Notification("application", 12, {"demo+default+application": 12}),
+        Notification("app.json", 3, {}),
+        Notification("other", 4, {}),
+    ]
+
+
+def test_parse_notifications_not_modified() -> None:
+    assert parse_notifications_response(httpx.Response(304)) == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(401),
+        httpx.Response(500),
+        httpx.Response(200, content=b"not json"),
+        httpx.Response(200, json={"namespaceName": "application"}),
+        httpx.Response(200, json=[{"namespaceName": "application"}]),
+        httpx.Response(200, json=[{"namespaceName": "a", "notificationId": 1, "messages": 1}]),
+    ],
+)
+def test_parse_notifications_errors(response: httpx.Response) -> None:
+    with pytest.raises(ApolloError) as info:
+        parse_notifications_response(response)
     assert info.value.status_code == response.status_code
