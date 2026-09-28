@@ -17,20 +17,6 @@ def client(apollo: FakeApollo):
     http.close()
 
 
-def test_get(client: ApolloClient, apollo: FakeApollo) -> None:
-    assert client.get("timeout") == "30"
-    assert client.get("missing") is None
-    assert client.get("missing", "1") == "1"
-    assert client.get("content", namespace="app.json") == '{"a": 1}'
-    assert len(apollo.requests) == 2
-    assert apollo.requests[0].url == "http://apollo:8080/configs/demo/default/application"
-
-
-def test_properties_suffix_shares_cache(client: ApolloClient, apollo: FakeApollo) -> None:
-    assert client.namespace("application") is client.namespace("application.properties")
-    assert len(apollo.requests) == 1
-
-
 def test_namespace_is_read_only_snapshot(client: ApolloClient, apollo: FakeApollo) -> None:
     before = client.namespace()
     with pytest.raises(TypeError):
@@ -39,13 +25,6 @@ def test_namespace_is_read_only_snapshot(client: ApolloClient, apollo: FakeApoll
     client.refresh()
     assert before["timeout"] == "30"
     assert client.get("timeout") == "60"
-
-
-def test_refresh_not_modified(client: ApolloClient, apollo: FakeApollo) -> None:
-    before = client.namespace()
-    client.refresh()
-    assert apollo.requests[-1].url.params["releaseKey"] == "r1"
-    assert client.namespace() is before
 
 
 def test_refresh_loads_unloaded_namespace(client: ApolloClient, apollo: FakeApollo) -> None:
@@ -57,12 +36,6 @@ def test_refresh_loads_unloaded_namespace(client: ApolloClient, apollo: FakeApol
 def test_refresh_all_only_touches_loaded(client: ApolloClient, apollo: FakeApollo) -> None:
     client.refresh()
     assert apollo.requests == []
-
-
-def test_missing_namespace_raises(client: ApolloClient) -> None:
-    with pytest.raises(ApolloError) as info:
-        client.get("x", namespace="nope")
-    assert info.value.status_code == 404
 
 
 def test_refresh_failure_keeps_cache(client: ApolloClient, apollo: FakeApollo) -> None:

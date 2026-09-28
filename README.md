@@ -37,3 +37,20 @@ An `AsyncApolloClient` is bound to the event loop it is first used in.
 A client is meant to live as long as the process, usually as a module level object. It holds an
 httpx connection pool, so call `close()` (or `await client.aclose()`) if you create short lived
 clients. Both also work as context managers.
+
+## Testing
+
+`uv run pytest` runs the unit tests. Integration tests under `tests/integration` run against a real
+Apollo and are skipped unless `APOLLO_CONFIG_URL` is set. The easiest server is the
+[quick start](https://github.com/apolloconfig/apollo-quick-start) all in one jar with an in memory
+H2 database:
+
+```sh
+SPRING_PROFILES_ACTIVE=github,database-discovery,auth SPRING_PROFILES_GROUP_GITHUB=h2 \
+LOGGING_FILE_NAME=/tmp/apollo.log java -jar apollo-all-in-one.jar
+
+APOLLO_CONFIG_URL=http://localhost:8080 uv run pytest
+```
+
+The portal at `http://localhost:8070` is used to create apps and publish releases. It can be changed
+with `APOLLO_PORTAL_URL`, `APOLLO_PORTAL_USER`, `APOLLO_PORTAL_PASSWORD` and `APOLLO_ENV`.

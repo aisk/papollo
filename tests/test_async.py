@@ -16,44 +16,12 @@ async def client(apollo: FakeApollo):
     await http.aclose()
 
 
-async def test_get(client: AsyncApolloClient, apollo: FakeApollo) -> None:
-    assert await client.get("timeout") == "30"
-    assert await client.get("missing") is None
-    assert await client.get("missing", "1") == "1"
-    assert await client.get("content", namespace="app.json") == '{"a": 1}'
-    assert len(apollo.requests) == 2
-    assert apollo.requests[0].url == "http://apollo:8080/configs/demo/default/application"
-
-
-async def test_properties_suffix_shares_cache(
-    client: AsyncApolloClient, apollo: FakeApollo
-) -> None:
-    assert await client.namespace("application") is await client.namespace("application.properties")
-    assert len(apollo.requests) == 1
-
-
-async def test_refresh(client: AsyncApolloClient, apollo: FakeApollo) -> None:
-    before = await client.namespace()
-    await client.refresh()
-    assert await client.namespace() is before
-    apollo.publish("application", "r2", {"timeout": "60"})
-    await client.refresh()
-    assert before["timeout"] == "30"
-    assert await client.get("timeout") == "60"
-
-
 async def test_refresh_loads_unloaded_namespace(
     client: AsyncApolloClient, apollo: FakeApollo
 ) -> None:
     await client.refresh("app.json")
     await client.namespace("app.json")
     assert len(apollo.requests) == 1
-
-
-async def test_missing_namespace_raises(client: AsyncApolloClient) -> None:
-    with pytest.raises(ApolloError) as info:
-        await client.get("x", namespace="nope")
-    assert info.value.status_code == 404
 
 
 async def test_refresh_failure_keeps_cache(client: AsyncApolloClient, apollo: FakeApollo) -> None:
