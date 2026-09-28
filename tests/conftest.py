@@ -18,9 +18,14 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
 
 import httpx
 import pytest
+
+from papollo._cache import LocalCache
+from papollo._core import Snapshot
 
 CONFIG_URL = os.environ.get("APOLLO_CONFIG_URL", "http://localhost:8080")
 PORTAL_URL = os.environ.get("APOLLO_PORTAL_URL", "http://localhost:8070")
@@ -258,6 +263,15 @@ def fake_apollo() -> FakeApollo:
     fake.publish("application", "r1", {"timeout": "30", "name": "demo"})
     fake.publish("app.json", "j1", {"content": '{"a": 1}'})
     return fake
+
+
+def write_cache(
+    directory: Path, namespace: str, release_key: str, configurations: dict[str, str]
+) -> Path:
+    """Write a cache file for app ``demo`` as a client with ``cache_dir`` would."""
+    cache = LocalCache(directory, "demo", "default")
+    cache.save(namespace, Snapshot(release_key, MappingProxyType(configurations)))
+    return Path(cache.path(namespace))
 
 
 class Clock:

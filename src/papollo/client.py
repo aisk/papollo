@@ -1,3 +1,4 @@
+import os
 import socket
 import sys
 import threading
@@ -15,10 +16,12 @@ else:
     from typing_extensions import Self
 
 from . import _core, _fork
+from ._cache import LocalCache
 from ._core import (
     DEFAULT_NAMESPACE,
     Settings,
     Snapshot,
+    is_server_unavailable,
     logger,
     normalize_namespace,
     parse_config_response,
@@ -41,7 +44,8 @@ class Apollo:
     Namespaces are fetched on first access and then served from memory. Call ``refresh()`` to
     pull the latest release, set ``max_age`` to have a read refetch a namespace once its cached
     config is older than that many seconds, or set ``watch`` to have a background thread long
-    poll the server and refetch namespaces as soon as they are released.
+    poll the server and refetch namespaces as soon as they are released. Set ``cache_dir`` to
+    keep a copy of every namespace on disk, served when the server is down at first load.
     """
 
     def __init__(
@@ -56,11 +60,13 @@ class Apollo:
         timeout: float | None = None,
         max_age: float | None = None,
         watch: bool = False,
+        cache_dir: str | os.PathLike[str] | None = None,
         http_client: httpx.Client | None = None,
     ) -> None:
         self._settings = Settings(
             server_url.rstrip("/"), app_id, cluster, secret, ip, label, timeout
         )
+        self._cache = LocalCache(cache_dir, app_id, cluster) if cache_dir is not None else None
         self._max_age = max_age
         self._http = http_client if http_client is not None else httpx.Client()
         self._owns_http = http_client is None
@@ -97,7 +103,13 @@ class Apollo:
         name = normalize_namespace(name)
         snapshot = self._snapshots.get(name)
         if snapshot is None:
-            snapshot = self._load(name, only_if_missing=True)
+            try:
+                snapshot = self._load(name, only_if_missing=True)
+            except ApolloError:
+                # Served from the local cache if _load() restored it.
+                snapshot = self._snapshots.get(name)
+                if snapshot is None:
+                    raise
         elif self._is_stale(name):
             snapshot = self._refresh_stale(name, snapshot)
         self._ensure_watching()
@@ -108,7 +120,8 @@ class Apollo:
 
         A namespace that has not been loaded yet is loaded, so this can also be
         used to preload namespaces at startup. On failure the cached config is
-        kept and the error is raised after all namespaces were tried.
+        kept and the error is raised after all namespaces were tried. This also
+        holds when an unloaded namespace was loaded from ``cache_dir`` instead.
         """
         names = [normalize_namespace(name)] if name is not None else list(self._snapshots)
         error: Exception | None = None
@@ -202,11 +215,35 @@ class Apollo:
             before = self._snapshots.get(name)
             if only_if_missing and before is not None:
                 return before
-            snapshot = self._fetch(name, messages)
+            try:
+                snapshot = self._fetch(name, messages)
+            except ApolloError as exc:
+                if before is not None or not self._restore_cached(name, exc):
+                    raise
+                error: ApolloError | None = exc
+            else:
+                error = None
         if before is None:
             self._watch_new_namespace(name)
+        if error is not None:
+            raise error
         self._emit(name, before, snapshot)
         return snapshot
+
+    def _restore_cached(self, name: str, error: ApolloError) -> bool:
+        """Serve a namespace that failed to load from the local cache, the caller holds its lock.
+
+        The next fetch sends the cached release key, so it gets a 304 or the new release. The
+        error is raised anyway, ``namespace()`` catches it and ``refresh()`` passes it on.
+        """
+        if self._cache is None or not is_server_unavailable(error):
+            return False
+        snapshot = self._cache.load(name)
+        if snapshot is None:
+            return False
+        logger.warning("serving namespace %r from local cache: %s", name, error)
+        self._snapshots[name] = snapshot
+        return True
 
     def _emit(self, name: str, old: Snapshot | None, new: Snapshot) -> None:
         # Called without the namespace lock held, so a listener may read any namespace.
@@ -236,6 +273,8 @@ class Apollo:
                     f"unexpected 304 for unloaded namespace {name!r}", status_code=304
                 )
             return current
+        if self._cache is not None:
+            self._cache.save(name, snapshot)
         self._snapshots[name] = snapshot
         return snapshot
 

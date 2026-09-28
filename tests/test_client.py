@@ -1,13 +1,16 @@
+import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
 
 from papollo import Apollo, ApolloError
-from papollo._core import parse_notifications_response
+from papollo._core import parse_cache, parse_notifications_response
 
 from .conftest import (
     App,
@@ -18,6 +21,7 @@ from .conftest import (
     requires_fork,
     run_in_child,
     wait_until,
+    write_cache,
 )
 
 
@@ -292,6 +296,39 @@ def test_watch_fork(app: App, watching: Apollo, caplog: pytest.LogCaptureFixture
 def test_watch_off_by_default(client: Apollo) -> None:
     client.get("timeout")
     assert client._poller is None
+
+
+def test_cache_written(app: App, tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    with Apollo(app.config_url, app.app_id, cache_dir=cache_dir) as client:
+        client.get("timeout")
+        client.namespace("app.json")
+        release_key = client._snapshots["application"].release_key
+    assert cache_dir.stat().st_mode & 0o777 == 0o700
+    files = sorted(cache_dir.iterdir())
+    assert [f.name for f in files] == [
+        f"{app.app_id}+default+app.json.json",
+        f"{app.app_id}+default+application.json",
+    ]
+    assert all(f.stat().st_mode & 0o777 == 0o600 for f in files)
+    snapshot = parse_cache(files[1].read_bytes())
+    assert snapshot.release_key == release_key
+    assert snapshot.configurations == {"timeout": "30", "name": "demo"}
+
+
+def test_cache_served_when_unreachable(
+    app: App, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with Apollo(app.config_url, app.app_id, cache_dir=tmp_path) as client:
+        client.get("timeout")
+    with (
+        caplog.at_level(logging.WARNING, logger="papollo"),
+        Apollo("http://127.0.0.1:1", app.app_id, cache_dir=tmp_path) as client,
+    ):
+        assert client.get("timeout") == "30"
+        assert "from local cache" in caplog.text
+        with pytest.raises(ApolloError):
+            client.namespace("app.json")  # never cached
 
 
 # The tests below need no server, or a failure a real server can not produce on demand.
@@ -611,3 +648,157 @@ def test_close_in_listener_stops_watch(fake_watching: Apollo, fake_apollo: FakeA
     fake_apollo.publish("application", "r2", {"timeout": "60"})
     # Called in the poller thread, which then stops.
     wait_until(lambda: not poller_alive(fake_watching))
+
+
+@pytest.fixture
+def fake_http(fake_apollo: FakeApollo) -> Iterator[httpx.Client]:
+    with httpx.Client(transport=httpx.MockTransport(fake_apollo.handler)) as http:
+        yield http
+
+
+@pytest.mark.parametrize(
+    ("status_code", "served"), [(500, True), (503, True), (401, False), (404, False)]
+)
+def test_cache_fallback_status(
+    fake_apollo: FakeApollo,
+    fake_http: httpx.Client,
+    tmp_path: Path,
+    status_code: int,
+    served: bool,
+) -> None:
+    write_cache(tmp_path, "application", "r0", {"timeout": "10"})
+    fake_apollo.fail_with = status_code
+    with Apollo("http://apollo:8080", "demo", cache_dir=tmp_path, http_client=fake_http) as client:
+        if served:
+            assert client.get("timeout") == "10"
+        else:
+            # A wrong secret or namespace is a mistake a stale cache would hide.
+            with pytest.raises(ApolloError) as info:
+                client.get("timeout")
+            assert info.value.status_code == status_code
+
+
+def test_cache_refresh_raises_but_serves(
+    fake_apollo: FakeApollo, fake_http: httpx.Client, tmp_path: Path
+) -> None:
+    write_cache(tmp_path, "application", "r0", {"timeout": "10"})
+    fake_apollo.fail_with = 500
+    with Apollo("http://apollo:8080", "demo", cache_dir=tmp_path, http_client=fake_http) as client:
+        with pytest.raises(ApolloError) as info:
+            client.refresh("application")
+        assert info.value.status_code == 500
+        assert client.get("timeout") == "10"
+        assert len(fake_apollo.requests) == 1
+
+
+def test_cache_caught_up(fake_apollo: FakeApollo, fake_http: httpx.Client, tmp_path: Path) -> None:
+    path = write_cache(tmp_path, "application", "r1", {"timeout": "30", "name": "demo"})
+    fake_apollo.fail_with = 500
+    changes: list[dict[str, str]] = []
+    with Apollo("http://apollo:8080", "demo", cache_dir=tmp_path, http_client=fake_http) as client:
+        client.add_listener(lambda ns, old, new: changes.append(dict(new)))
+        before = client.namespace()
+        fake_apollo.fail_with = None
+        # The cached release key is sent, the server has nothing newer.
+        client.refresh()
+        assert fake_apollo.config_requests[-1].url.params["releaseKey"] == "r1"
+        assert client.namespace() is before
+        fake_apollo.publish("application", "r2", {"timeout": "60"})
+        client.refresh()
+        assert client.get("timeout") == "60"
+    assert changes == [{"timeout": "60"}]
+    assert parse_cache(path.read_bytes()).release_key == "r2"
+    assert os.listdir(tmp_path) == [path.name]  # no temporary files left
+
+
+def test_cache_corrupt(
+    fake_apollo: FakeApollo,
+    fake_http: httpx.Client,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    path = write_cache(tmp_path, "application", "r0", {"timeout": "10"})
+    path.write_bytes(b'{"format": 1, "releaseKey"')
+    fake_apollo.fail_with = 500
+    with (
+        caplog.at_level(logging.WARNING, logger="papollo"),
+        Apollo("http://apollo:8080", "demo", cache_dir=tmp_path, http_client=fake_http) as client,
+        pytest.raises(ApolloError) as info,
+    ):
+        client.get("timeout")
+    assert info.value.status_code == 500
+    assert "ignoring unreadable config cache" in caplog.text
+
+
+def test_cache_write_failure_logged(
+    fake_http: httpx.Client, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    not_a_dir = tmp_path / "file"
+    not_a_dir.touch()
+    with (
+        caplog.at_level(logging.WARNING, logger="papollo"),
+        Apollo("http://apollo:8080", "demo", cache_dir=not_a_dir, http_client=fake_http) as client,
+    ):
+        assert client.get("timeout") == "30"
+    assert "failed to write config cache" in caplog.text
+
+
+def test_cache_failed_write_leaves_no_temp_file(
+    fake_http: httpx.Client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def broken_replace(src: str, dst: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", broken_replace)
+    with (
+        caplog.at_level(logging.WARNING, logger="papollo"),
+        Apollo("http://apollo:8080", "demo", cache_dir=tmp_path, http_client=fake_http) as client,
+    ):
+        assert client.get("timeout") == "30"
+    assert "disk full" in caplog.text
+    assert os.listdir(tmp_path) == []
+
+
+def test_cache_path_stays_in_directory(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"releaseKey": "r1", "configurations": {"k": "v"}})
+
+    cache_dir = tmp_path / "cache"
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as http,
+        Apollo(
+            "http://apollo:8080", "../../x", cluster="a/..", cache_dir=cache_dir, http_client=http
+        ) as client,
+    ):
+        client.namespace("../../../etc/passwd")
+    [path] = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert path.parent == cache_dir
+
+
+@pytest.mark.usefixtures("fast_retry")
+def test_cache_watch_catches_up(
+    fake_apollo: FakeApollo,
+    fake_http: httpx.Client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def create_poll_http(self: Apollo) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(fake_apollo.handler))
+
+    monkeypatch.setattr(Apollo, "_create_poll_http", create_poll_http)
+    path = write_cache(tmp_path, "application", "r1", {"timeout": "30", "name": "demo"})
+    fake_apollo.fail_with = 500
+    with Apollo(
+        "http://apollo:8080", "demo", watch=True, cache_dir=tmp_path, http_client=fake_http
+    ) as client:
+        assert client.get("timeout") == "30"
+        wait_until(lambda: fake_apollo.poll_requests)
+        notifications = json.loads(fake_apollo.poll_requests[0].url.params["notifications"])
+        assert notifications == [{"namespaceName": "application", "notificationId": -1}]
+        fake_apollo.publish("application", "r2", {"timeout": "60"})
+        fake_apollo.fail_with = None
+        wait_until(lambda: client.get("timeout") == "60")
+    assert parse_cache(path.read_bytes()).release_key == "r2"
