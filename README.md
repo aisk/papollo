@@ -23,19 +23,14 @@ await client.get("timeout")
 await client.refresh()
 ```
 
-A client is meant to live as long as the process, usually as a module level object. It holds an
-httpx connection pool, so call `close()` (or `await client.aclose()`) if you create short lived
-clients. Both also work as context managers. An `AsyncApollo` is bound to the event loop it
-is first used in.
-
-Clients survive `os.fork()`, so one created before gunicorn or a multiprocessing pool forks its
-workers keeps working in them. A child keeps the configs already loaded and gets a new connection
-pool, as sharing the parent's sockets would mix up responses. An `AsyncApollo` can then be used in
-the child's own event loop. An `http_client` you pass in is left alone, create it after the fork.
-
 Namespaces are fetched on first access and then served from memory. `refresh()` refetches every
 loaded namespace, and `refresh(name)` also loads a namespace that was not loaded yet, which is handy
 for failing fast at startup. Failures raise `ApolloError` and keep the previously cached config.
+
+A client is meant to live as long as the process, usually as a module level object. It holds an
+httpx connection pool, so call `close()` (or `await client.aclose()`) if you create short lived
+clients. Both also work as context managers. An `AsyncApollo` is bound to the event loop it is
+first used in.
 
 To pick up new releases without calling `refresh()`, set `max_age` in seconds. A read of a
 namespace older than that refetches it first, which is cheap when nothing changed as the server
@@ -46,18 +41,20 @@ Apollo suggests polling no more often than every 30 seconds.
 
 To get new releases within a second or so, pass `watch=True`. The client then long polls Apollo's
 notification endpoint for every loaded namespace, and refetches a namespace as soon as the server
-reports a new release for it. Polling starts with the first read or `refresh()`, not when the client
-is created, so a client created at import time in a process that never reads it runs nothing. An
+reports a new release for it. Polling starts once a namespace is loaded, not when the client is
+created, so a client created at import time in a process that never reads it runs nothing. An
 `Apollo` polls in a daemon thread, an `AsyncApollo` in a task of its event loop. A namespace loaded
-later aborts the poll in flight so the next one covers it too. As the server holds each poll for up to
-60 seconds, polling does not use `http_client` but an httpx client of its own. Pass
-`watch_http_client` when it needs settings too, such as `verify` for an internal CA, a proxy or
-headers. Give it a client used for nothing else, papollo sends every poll on a new HTTP/1.1
-connection so it can abort it, and leaves the client open. Failures are
-logged as warnings to the `papollo` logger and retried after a delay doubling from 1 up to 120
-seconds. `close()` and `aclose()` stop polling right away. The poller keeps the client alive until
-then, so always close a watching client that does not live as long as the process. `max_age` can be
-combined with `watch` as a fallback in case notifications are lost.
+later aborts the poll in flight so the next one covers it too. Failures are logged as warnings to
+the `papollo` logger and retried after a delay doubling from 1 up to 120 seconds. `close()` and
+`aclose()` stop polling right away. The poller keeps the client alive until then, so always close a
+watching client that does not live as long as the process. `max_age` can be combined with `watch`
+as a fallback in case notifications are lost.
+
+As the server holds each poll for up to 60 seconds, polling does not use `http_client` but an httpx
+client of its own. Pass `watch_http_client` when polling needs settings too, such as `verify` for
+an internal CA, a proxy or headers. papollo does not close it. An `Apollo` sends every poll on a new
+HTTP/1.1 connection so that it can abort it, so give it a client used for nothing else and without
+`http2=True`.
 
 ```python
 client = Apollo("http://apollo-config:8080", "demo-app", watch=True)
@@ -74,12 +71,6 @@ configurations whenever a loaded namespace changes, whether through `watch`, `re
 `AsyncApollo` also accepts coroutine functions and awaits them. Exceptions raised by a listener are
 logged and do not stop other listeners. `remove_listener()` unregisters one.
 
-Polling does not survive `os.fork()`, a child starts its own on its next read. If the parent is
-already polling when it forks, Python 3.12 and later emit a `DeprecationWarning` because the process
-has a thread. papollo resets its own state in the child, but other libraries may not, so prefer to
-read config only in the workers, for example from gunicorn's `post_fork` hook, and not in the
-master process.
-
 To start while the config service is down, set `cache_dir`, like the Java client's local cache.
 Every new release fetched is also written to `{app_id}+{cluster}+{namespace}.json` in that
 directory, which is created if missing. Files are replaced atomically, so processes can share a
@@ -93,6 +84,16 @@ check at startup notices, and reads after it are served from the cache. From the
 counts as loaded with the cached release, which `refresh()`, `max_age` or `watch` refetch like any
 other, and listeners are called when the server has a newer one. A cache file that can not be read
 is ignored and failing to write one never fails a fetch, both are logged as warnings.
+
+Clients survive `os.fork()`, so one created before gunicorn or a multiprocessing pool forks its
+workers keeps working in them. A child keeps the configs already loaded and gets a new connection
+pool, as sharing the parent's sockets would mix up responses. An `AsyncApollo` can then be used in
+the child's own event loop. Polling does not survive the fork, a child starts its own on its next
+read. An `http_client` or `watch_http_client` you pass in is left alone, create it after the fork.
+If the parent is already polling when it forks, Python 3.12 and later emit a `DeprecationWarning`
+because the process has a thread. papollo resets its own state in the child, but other libraries
+may not, so prefer to read config only in the workers, for example from gunicorn's `post_fork`
+hook, and not in the master process.
 
 Other options: `cluster`, `secret` (access key), `ip` and `label` (gray release), `timeout`, and
 `http_client` to bring your own `httpx.Client` / `httpx.AsyncClient`. When `timeout` is not set, the
