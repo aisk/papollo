@@ -44,6 +44,38 @@ reader refreshes, others are served the cached config. If the refresh fails the 
 served and a warning is logged to the `papollo` logger, and the next try waits another `max_age`.
 Apollo suggests polling no more often than every 30 seconds.
 
+To get new releases within a second or so, pass `watch=True`. The client then long polls Apollo's
+notification endpoint for every loaded namespace, and refetches a namespace as soon as the server
+reports a new release for it. Polling starts with the first read or `refresh()`, not when the client
+is created, so a client created at import time in a process that never reads it runs nothing. An
+`Apollo` polls in a daemon thread, an `AsyncApollo` in a task of its event loop. A namespace loaded
+later aborts the poll in flight so the next one covers it too. The long poll uses its own httpx
+client, as the server holds each request for up to 60 seconds, never the `http_client` you pass
+in. Failures are logged as warnings to the `papollo` logger and retried after a delay doubling from
+1 up to 120 seconds. `close()` and `aclose()` stop polling right away. `max_age` can be combined
+with `watch` as a fallback in case notifications are lost.
+
+```python
+client = Apollo("http://apollo-config:8080", "demo-app", watch=True)
+
+@client.add_listener
+def on_change(namespace, old, new):
+    print(namespace, old.get("timeout"), "->", new.get("timeout"))
+```
+
+Listeners registered with `add_listener()` are called with the namespace name and its old and new
+configurations whenever a loaded namespace changes, whether through `watch`, `refresh()` or
+`max_age`. They are not called on first load, nor when a refetch finds nothing changed. An
+`Apollo` calls them in the thread that fetched the change, a listener may read the client. An
+`AsyncApollo` also accepts coroutine functions and awaits them. Exceptions raised by a listener are
+logged and do not stop other listeners. `remove_listener()` unregisters one.
+
+Polling does not survive `os.fork()`, a child starts its own on its next read. If the parent is
+already polling when it forks, Python 3.12 and later emit a `DeprecationWarning` because the process
+has a thread. papollo resets its own state in the child, but other libraries may not, so prefer to
+read config only in the workers, for example from gunicorn's `post_fork` hook, and not in the
+master process.
+
 Other options: `cluster`, `secret` (access key), `ip` and `label` (gray release), `timeout`, and
 `http_client` to bring your own `httpx.Client` / `httpx.AsyncClient`. When `timeout` is not set, the
 httpx client's own timeout is used. `ip` is not detected automatically, so IP based gray release
