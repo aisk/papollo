@@ -88,9 +88,15 @@ class AsyncApollo:
     async def get(
         self, key: str, default: object = None, *, namespace: str = DEFAULT_NAMESPACE
     ) -> object:
+        """Return the value of ``key`` in a namespace, or ``default`` if it is not set."""
         return (await self.namespace(namespace)).get(key, default)
 
     async def namespace(self, name: str = DEFAULT_NAMESPACE) -> Mapping[str, str]:
+        """Return a read only mapping of a namespace's config, loading it on first access.
+
+        A non-properties namespace such as ``app.json`` has its text under the ``content`` key.
+        Raises ``ApolloError`` if it can not be loaded and is not in ``cache_dir`` either.
+        """
         name = normalize_namespace(name)
         snapshot = self._snapshots.get(name)
         if snapshot is None:
@@ -133,9 +139,11 @@ class AsyncApollo:
         return callback
 
     def remove_listener(self, callback: AsyncListener) -> None:
+        """Unregister a callback added with ``add_listener()``, if it was."""
         self._listeners = tuple(cb for cb in self._listeners if cb != callback)
 
     async def aclose(self) -> None:
+        """Stop watching and close the httpx client, unless it was passed in."""
         self._closed = True
         task = self._poll_task
         if (
