@@ -264,7 +264,7 @@ def test_watch_access_key(app: App) -> None:
 
 @requires_fork
 @pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
-def test_watch_fork(app: App, watching: Apollo) -> None:
+def test_watch_fork(app: App, watching: Apollo, caplog: pytest.LogCaptureFixture) -> None:
     changes: list[str | None] = []
     watching.add_listener(lambda ns, old, new: changes.append(new.get("timeout")))
     watching.get("timeout")
@@ -281,10 +281,12 @@ def test_watch_fork(app: App, watching: Apollo) -> None:
         watching.close()
         return restarted, changes, watching.get("timeout")
 
-    assert run_in_child(child, timeout=30) == (True, ["60"], "60")
-    # The parent kept polling on its own connection.
-    wait_until(lambda: changes)
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        assert run_in_child(child, timeout=30) == (True, ["60"], "60")
+        # The parent kept polling on its own connection, the child did not break it.
+        wait_until(lambda: changes)
     assert changes == ["60"]
+    assert caplog.records == []
 
 
 def test_watch_off_by_default(client: Apollo) -> None:

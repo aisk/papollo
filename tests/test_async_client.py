@@ -219,7 +219,9 @@ async def test_watch_access_key(app: App) -> None:
 
 @requires_fork
 @pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
-async def test_watch_fork(app: App, watching: AsyncApollo) -> None:
+async def test_watch_fork(
+    app: App, watching: AsyncApollo, caplog: pytest.LogCaptureFixture
+) -> None:
     changes: list[str | None] = []
     watching.add_listener(lambda ns, old, new: changes.append(new.get("timeout")))
     await watching.get("timeout")
@@ -237,10 +239,12 @@ async def test_watch_fork(app: App, watching: AsyncApollo) -> None:
         await watching.aclose()
         return restarted, changes, await watching.get("timeout")
 
-    assert run_in_child(lambda: asyncio.run(child()), timeout=30) == (True, ["60"], "60")
-    # The parent kept polling on its own connection.
-    await async_wait_until(lambda: changes)
+    with caplog.at_level(logging.WARNING, logger="papollo"):
+        assert run_in_child(lambda: asyncio.run(child()), timeout=30) == (True, ["60"], "60")
+        # The parent kept polling on its own connection, the child did not break it.
+        await async_wait_until(lambda: changes)
     assert changes == ["60"]
+    assert caplog.records == []
     assert watching._poll_task is parent_task
 
 
