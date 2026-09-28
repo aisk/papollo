@@ -4,6 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
@@ -13,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v7
@@ -26,5 +30,6 @@ jobs:
             exit 1
           fi
 
-      - run: uv build
-      - run: uv publish
+      - run: uv build --no-sources
+      # Skips files already on PyPI, so a failed release can be rerun.
+      - run: uv publish --check-url https://pypi.org/simple/
