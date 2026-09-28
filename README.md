@@ -37,6 +37,13 @@ Namespaces are fetched on first access and then served from memory. `refresh()` 
 loaded namespace, and `refresh(name)` also loads a namespace that was not loaded yet, which is handy
 for failing fast at startup. Failures raise `ApolloError` and keep the previously cached config.
 
+To pick up new releases without calling `refresh()`, set `max_age` in seconds. A read of a
+namespace older than that refetches it first, which is cheap when nothing changed as the server
+answers 304. There is no background thread, a namespace nobody reads is not refetched. While one
+reader refreshes, others are served the cached config. If the refresh fails the cached config is
+served and a warning is logged to the `papollo` logger, and the next try waits another `max_age`.
+Apollo suggests polling no more often than every 30 seconds.
+
 Other options: `cluster`, `secret` (access key), `ip` and `label` (gray release), `timeout`, and
 `http_client` to bring your own `httpx.Client` / `httpx.AsyncClient`. When `timeout` is not set, the
 httpx client's own timeout is used. `ip` is not detected automatically, so IP based gray release

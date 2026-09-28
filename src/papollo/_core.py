@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ import httpx
 from .exceptions import ApolloError
 
 DEFAULT_NAMESPACE = "application"
+
+logger = logging.getLogger("papollo")
 
 _PROPERTIES_SUFFIX = ".properties"
 

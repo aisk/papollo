@@ -198,6 +198,24 @@ def fake_apollo() -> FakeApollo:
     return fake
 
 
+class Clock:
+    """Stands in for ``time.monotonic`` in the client modules, so max_age can be tested."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    clock = Clock()
+    monkeypatch.setattr("papollo.client.monotonic", clock)
+    monkeypatch.setattr("papollo.async_client.monotonic", clock)
+    return clock
+
+
 def run_in_child(fn: Callable[[], object], timeout: int = 10) -> object:
     """Run ``fn`` in a forked child and return its result, or raise if it failed or hung."""
     read_fd, write_fd = os.pipe()

@@ -1,6 +1,7 @@
 import sys
 import threading
 from collections.abc import Mapping
+from time import monotonic
 from types import TracebackType
 from typing import TypeVar, overload
 
@@ -16,6 +17,7 @@ from ._core import (
     DEFAULT_NAMESPACE,
     Settings,
     Snapshot,
+    logger,
     normalize_namespace,
     parse_config_response,
 )
@@ -27,8 +29,9 @@ T = TypeVar("T")
 class Apollo:
     """Blocking Apollo config client.
 
-    Namespaces are fetched on first access and then served from memory.
-    Call ``refresh()`` to pull the latest release.
+    Namespaces are fetched on first access and then served from memory. Call ``refresh()`` to
+    pull the latest release, or set ``max_age`` to have a read refetch a namespace once its
+    cached config is older than that many seconds.
     """
 
     def __init__(
@@ -41,14 +44,17 @@ class Apollo:
         ip: str | None = None,
         label: str | None = None,
         timeout: float | None = None,
+        max_age: float | None = None,
         http_client: httpx.Client | None = None,
     ) -> None:
         self._settings = Settings(
             server_url.rstrip("/"), app_id, cluster, secret, ip, label, timeout
         )
+        self._max_age = max_age
         self._http = http_client if http_client is not None else httpx.Client()
         self._owns_http = http_client is None
         self._snapshots: dict[str, Snapshot] = {}
+        self._fetched_at: dict[str, float] = {}
         self._locks: dict[str, threading.Lock] = {}
         _fork.track(self)
 
@@ -66,6 +72,8 @@ class Apollo:
         snapshot = self._snapshots.get(name)
         if snapshot is None:
             snapshot = self._load(name, only_if_missing=True)
+        elif self._is_stale(name):
+            snapshot = self._refresh_stale(name, snapshot)
         return snapshot.configurations
 
     def refresh(self, name: str | None = None) -> None:
@@ -107,23 +115,49 @@ class Apollo:
         if self._owns_http:
             self._http = httpx.Client()
 
+    def _is_stale(self, name: str) -> bool:
+        return self._max_age is not None and monotonic() - self._fetched_at[name] >= self._max_age
+
+    def _refresh_stale(self, name: str, current: Snapshot) -> Snapshot:
+        lock = self._locks.setdefault(name, threading.Lock())
+        # Only one reader refreshes, the others keep serving the cached config meanwhile.
+        if not lock.acquire(blocking=False):
+            return current
+        try:
+            if not self._is_stale(name):
+                return self._snapshots[name]
+            try:
+                return self._fetch(name)
+            except ApolloError as exc:
+                logger.warning("serving cached config after refresh failed: %s", exc)
+                return self._snapshots[name]
+        finally:
+            lock.release()
+
     def _load(self, name: str, *, only_if_missing: bool = False) -> Snapshot:
         with self._locks.setdefault(name, threading.Lock()):
             current = self._snapshots.get(name)
             if only_if_missing and current is not None:
                 return current
-            release_key = current.release_key if current is not None else None
-            try:
-                request = self._settings.build_config_request(self._http, name, release_key)
-                response = self._http.send(request)
-            except (httpx.HTTPError, httpx.InvalidURL) as exc:
-                raise ApolloError(f"failed to fetch namespace {name!r}: {exc}") from exc
-            snapshot = parse_config_response(response, name)
-            if snapshot is None:
-                if current is None:
-                    raise ApolloError(
-                        f"unexpected 304 for unloaded namespace {name!r}", status_code=304
-                    )
-                return current
-            self._snapshots[name] = snapshot
-            return snapshot
+            return self._fetch(name)
+
+    def _fetch(self, name: str) -> Snapshot:
+        """Fetch a namespace, the caller must hold its lock."""
+        current = self._snapshots.get(name)
+        release_key = current.release_key if current is not None else None
+        # Set before the request, so a failing server is retried once per max_age at most.
+        self._fetched_at[name] = monotonic()
+        try:
+            request = self._settings.build_config_request(self._http, name, release_key)
+            response = self._http.send(request)
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            raise ApolloError(f"failed to fetch namespace {name!r}: {exc}") from exc
+        snapshot = parse_config_response(response, name)
+        if snapshot is None:
+            if current is None:
+                raise ApolloError(
+                    f"unexpected 304 for unloaded namespace {name!r}", status_code=304
+                )
+            return current
+        self._snapshots[name] = snapshot
+        return snapshot

@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -7,7 +8,7 @@ import pytest
 
 from papollo import Apollo, ApolloError
 
-from .conftest import App, FakeApollo, ResponseRecorder, requires_fork, run_in_child
+from .conftest import App, Clock, FakeApollo, ResponseRecorder, requires_fork, run_in_child
 
 
 @pytest.fixture
@@ -114,6 +115,22 @@ def test_access_key(app: App) -> None:
     assert info.value.status_code == 401
 
 
+def test_max_age(app: App, recorder: ResponseRecorder, clock: Clock) -> None:
+    with (
+        httpx.Client(event_hooks={"response": [recorder]}) as http,
+        Apollo(app.config_url, app.app_id, max_age=60, http_client=http) as client,
+    ):
+        assert client.get("timeout") == "30"
+        app.publish("application", "timeout=60")
+        clock.now += 59
+        assert client.get("timeout") == "30"
+        clock.now += 1
+        assert client.get("timeout") == "60"
+        clock.now += 60
+        assert client.get("timeout") == "60"
+    assert recorder.statuses == [200, 200, 304]
+
+
 @requires_fork
 def test_fork(app: App) -> None:
     with Apollo(app.config_url, app.app_id) as client:
@@ -211,6 +228,58 @@ def test_concurrent_first_load_fetches_once(fake_apollo: FakeApollo) -> None:
         t.join(5)
     assert results == ["30"] * 5
     assert len(fake_apollo.requests) == 1
+
+
+def test_max_age_off_by_default(fake_client: Apollo, fake_apollo: FakeApollo, clock: Clock) -> None:
+    fake_client.get("timeout")
+    clock.now += 10**6
+    fake_client.get("timeout")
+    assert len(fake_apollo.requests) == 1
+
+
+def test_max_age_failure_serves_cache(
+    fake_apollo: FakeApollo, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    http = httpx.Client(transport=httpx.MockTransport(fake_apollo.handler))
+    with Apollo("http://apollo:8080", "demo", max_age=10, http_client=http) as client:
+        client.get("timeout")
+        fake_apollo.fail_with = 500
+        clock.now += 10
+        with caplog.at_level(logging.WARNING, logger="papollo"):
+            assert client.get("timeout") == "30"
+        assert "HTTP 500" in caplog.text
+        # A failed refresh is not retried on every read, only once max_age passed again.
+        clock.now += 9
+        client.get("timeout")
+        assert len(fake_apollo.requests) == 2
+        clock.now += 1
+        client.get("timeout")
+        assert len(fake_apollo.requests) == 3
+
+
+def test_max_age_readers_do_not_wait(fake_apollo: FakeApollo, clock: Clock) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if fake_apollo.requests:
+            started.set()
+            release.wait(5)
+        return fake_apollo.handler(request)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    with Apollo("http://apollo:8080", "demo", max_age=10, http_client=http) as client:
+        client.get("timeout")
+        fake_apollo.publish("application", "r2", {"timeout": "60"})
+        clock.now += 10
+        refresher = threading.Thread(target=client.get, args=("timeout",))
+        refresher.start()
+        assert started.wait(5)
+        assert client.get("timeout") == "30"  # served from cache while the refresh is blocked
+        release.set()
+        refresher.join(5)
+        assert client.get("timeout") == "60"
+    assert len(fake_apollo.requests) == 2
 
 
 @requires_fork

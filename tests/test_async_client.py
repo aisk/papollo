@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 import httpx
@@ -6,7 +7,7 @@ import pytest
 
 from papollo import ApolloError, AsyncApollo
 
-from .conftest import App, FakeApollo, ResponseRecorder, requires_fork, run_in_child
+from .conftest import App, Clock, FakeApollo, ResponseRecorder, requires_fork, run_in_child
 
 
 @pytest.fixture
@@ -66,6 +67,20 @@ async def test_access_key(app: App) -> None:
     secret = app.portal.enable_access_key(app.app_id)
     async with AsyncApollo(app.config_url, app.app_id, secret=secret) as client:
         assert await client.get("timeout") == "30"
+
+
+async def test_max_age(app: App, recorder: ResponseRecorder, clock: Clock) -> None:
+    async with (
+        httpx.AsyncClient(event_hooks={"response": [recorder.async_hook]}) as http,
+        AsyncApollo(app.config_url, app.app_id, max_age=60, http_client=http) as client,
+    ):
+        assert await client.get("timeout") == "30"
+        app.publish("application", "timeout=60")
+        clock.now += 59
+        assert await client.get("timeout") == "30"
+        clock.now += 1
+        assert await client.get("timeout") == "60"
+    assert recorder.statuses == [200, 200]
 
 
 @requires_fork
@@ -146,3 +161,41 @@ async def test_namespaces_load_independently(fake_apollo: FakeApollo) -> None:
         assert await asyncio.wait_for(client.get("content", namespace="app.json"), 1) == '{"a": 1}'
         gate.set()
         await slow
+
+
+async def test_max_age_failure_serves_cache(
+    fake_apollo: FakeApollo, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fake_apollo.handler))
+    async with AsyncApollo("http://apollo:8080", "demo", max_age=10, http_client=http) as client:
+        await client.get("timeout")
+        fake_apollo.fail_with = 500
+        clock.now += 10
+        with caplog.at_level(logging.WARNING, logger="papollo"):
+            assert await client.get("timeout") == "30"
+        assert "HTTP 500" in caplog.text
+        clock.now += 9
+        await client.get("timeout")
+        assert len(fake_apollo.requests) == 2
+
+
+async def test_max_age_readers_do_not_wait(fake_apollo: FakeApollo, clock: Clock) -> None:
+    gate = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if fake_apollo.requests:
+            await gate.wait()
+        return fake_apollo.handler(request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with AsyncApollo("http://apollo:8080", "demo", max_age=10, http_client=http) as client:
+        await client.get("timeout")
+        fake_apollo.publish("application", "r2", {"timeout": "60"})
+        clock.now += 10
+        refresher = asyncio.create_task(client.get("timeout"))
+        while not client._locks["application"].locked():
+            await asyncio.sleep(0)
+        assert await asyncio.wait_for(client.get("timeout"), 1) == "30"
+        gate.set()
+        assert await refresher == "60"
+    assert len(fake_apollo.requests) == 2
