@@ -72,7 +72,9 @@ class Apollo:
         self._owns_http = http_client is None
         self._snapshots: dict[str, Snapshot] = {}
         self._fetched_at: dict[str, float] = {}
+        # Replaced rather than mutated, so _emit() iterates without the lock.
         self._listeners: tuple[Listener, ...] = ()
+        self._listeners_lock = threading.Lock()
         self._locks: dict[str, threading.Lock] = {}
         self._watch = watch
         self._notification_ids: dict[str, int] = {}
@@ -141,12 +143,15 @@ class Apollo:
         ``refresh()`` or the watch thread, and exceptions it raises are logged to the ``papollo``
         logger. Returns the callback, so it can be used as a decorator.
         """
-        if callback not in self._listeners:
-            self._listeners = (*self._listeners, callback)
+        with self._listeners_lock:
+            if callback not in self._listeners:
+                self._listeners = (*self._listeners, callback)
         return callback
 
     def remove_listener(self, callback: Listener) -> None:
-        self._listeners = tuple(cb for cb in self._listeners if cb != callback)
+        """Unregister a callback added with ``add_listener()``, if it was."""
+        with self._listeners_lock:
+            self._listeners = tuple(cb for cb in self._listeners if cb != callback)
 
     def close(self) -> None:
         with self._poll_lock:
@@ -176,6 +181,7 @@ class Apollo:
         # Locks may be held by threads that are gone, and the pooled sockets are shared with the
         # parent. The old client is dropped rather than closed, closing it could block on its lock.
         self._locks = {}
+        self._listeners_lock = threading.Lock()
         if self._owns_http:
             self._http = httpx.Client()
         # The poller thread does not exist in the child, the next read starts a new one. The

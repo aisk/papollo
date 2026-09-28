@@ -13,6 +13,7 @@ import pytest
 from papollo import Apollo, ApolloError
 from papollo._cache import LocalCache
 from papollo._core import Snapshot, parse_cache, parse_notifications_response
+from papollo.client import Listener
 
 from .conftest import (
     App,
@@ -875,3 +876,25 @@ def test_cache_fd_closed_when_fdopen_fails(
 def test_cache_dir_expands_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     assert LocalCache("~/cache", "demo", "default").directory == str(tmp_path / "cache")
+
+
+def test_concurrent_add_listener() -> None:
+    client = Apollo("http://apollo:8080", "demo")
+    listeners = [lambda ns, old, new: None for _ in range(8)]
+    for _ in range(50):
+        barrier = threading.Barrier(len(listeners))
+
+        def add(listener: Listener, barrier: threading.Barrier = barrier) -> None:
+            barrier.wait()
+            client.add_listener(listener)
+
+        threads = [threading.Thread(target=add, args=(listener,)) for listener in listeners]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # None of the registrations may be lost to another thread's.
+        assert set(client._listeners) == set(listeners)
+        for listener in listeners:
+            client.remove_listener(listener)
+    client.close()
