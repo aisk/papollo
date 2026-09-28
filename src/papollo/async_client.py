@@ -167,7 +167,10 @@ class AsyncApollo:
         if self._owns_http:
             self._http = httpx.AsyncClient()
         # The poller task belongs to the parent's event loop, the next read in the child starts a
-        # new one in the child's loop.
+        # new one in the child's loop. Not handled: a child forked from a coroutine that keeps
+        # running the parent's loop also keeps its poller task, which goes on reading the socket
+        # shared with the parent. Cancelling it would not help, closing its connection could
+        # send a TLS close_notify on that socket. asyncio does not support this case either.
         self._poll_task = None
         self._poll_request = None
 
