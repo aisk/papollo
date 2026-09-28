@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+env:
+  APOLLO_QUICK_START_REF: aaa77a161d5cafa8058d64e7d7ccd868d86742c0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+      - run: uv run mypy --strict src
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Apollo quick start
+        id: cache-apollo
+        uses: actions/cache@v6
+        with:
+          path: apollo-all-in-one.jar
+          key: apollo-quick-start-${{ env.APOLLO_QUICK_START_REF }}
+
+      - name: Download Apollo quick start
+        if: steps.cache-apollo.outputs.cache-hit != 'true'
+        run: >
+          curl -fsSL -o apollo-all-in-one.jar
+          https://raw.githubusercontent.com/apolloconfig/apollo-quick-start/${APOLLO_QUICK_START_REF}/apollo-all-in-one.jar
+
+      - name: Start Apollo
+        env:
+          SPRING_PROFILES_ACTIVE: github,database-discovery,auth
+          SPRING_PROFILES_GROUP_GITHUB: h2
+          SPRING_H2_CONSOLE_ENABLED: "false"
+          LOGGING_FILE_NAME: ${{ runner.temp }}/apollo/apollo.log
+        run: |
+          nohup java -jar apollo-all-in-one.jar > "$RUNNER_TEMP/apollo.out" 2>&1 &
+          for _ in $(seq 1 90); do
+            if curl -fs -o /dev/null localhost:8070/signin && curl -s -o /dev/null localhost:8080/configs/x/default/application; then
+              exit 0
+            fi
+            sleep 2
+          done
+          tail -n 100 "$RUNNER_TEMP/apollo.out"
+          exit 1
+
+      - run: uv run pytest -v
+        env:
+          PAPOLLO_REQUIRE_APOLLO: "1"
+
+      - name: Apollo log
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/apollo.out"
