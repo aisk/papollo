@@ -5,20 +5,22 @@ Python client for [Apollo](https://github.com/apolloconfig/apollo) config center
 ```python
 from papollo import ApolloClient
 
-with ApolloClient("http://apollo-config:8080", "demo-app") as client:
-    client.get("timeout")                          # "30", or None if missing
-    client.get("timeout", "10")                    # with default
-    client.get("db.url", namespace="database")
-    client.namespace("app.json")["content"]        # non-properties namespace
-    client.refresh()                               # pull latest releases
+client = ApolloClient("http://apollo-config:8080", "demo-app")
+
+client.get("timeout")                          # "30", or None if missing
+client.get("timeout", "10")                    # with default
+client.get("db.url", namespace="database")
+client.namespace("app.json")["content"]        # non-properties namespace
+client.refresh()                               # pull latest releases
 ```
 
 ```python
 from papollo import AsyncApolloClient
 
-async with AsyncApolloClient("http://apollo-config:8080", "demo-app") as client:
-    await client.get("timeout")
-    await client.refresh()
+client = AsyncApolloClient("http://apollo-config:8080", "demo-app")
+
+await client.get("timeout")
+await client.refresh()
 ```
 
 Namespaces are fetched on first access and then served from memory. `refresh()` refetches every
@@ -31,3 +33,7 @@ httpx client's own timeout is used. `ip` is not detected automatically, so IP ba
 only works when it is set.
 
 An `AsyncApolloClient` is bound to the event loop it is first used in.
+
+A client is meant to live as long as the process, usually as a module level object. It holds an
+httpx connection pool, so call `close()` (or `await client.aclose()`) if you create short lived
+clients. Both also work as context managers.

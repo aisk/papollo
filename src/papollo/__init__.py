@@ -1,5 +1,5 @@
-from ._async import AsyncApolloClient
-from ._core import ApolloError
-from ._sync import ApolloClient
+from .async_client import AsyncApolloClient
+from .client import ApolloClient
+from .exceptions import ApolloError
 
 __all__ = ["ApolloClient", "ApolloError", "AsyncApolloClient"]

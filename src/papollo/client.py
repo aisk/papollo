@@ -1,4 +1,4 @@
-import asyncio
+import threading
 from collections.abc import Mapping
 from types import TracebackType
 from typing import Self, overload
@@ -7,18 +7,19 @@ import httpx
 
 from ._core import (
     DEFAULT_NAMESPACE,
-    ApolloError,
     Settings,
     Snapshot,
     normalize_namespace,
     parse_config_response,
 )
+from .exceptions import ApolloError
 
 
-class AsyncApolloClient:
-    """Asyncio Apollo config client, same API as ``ApolloClient``.
+class ApolloClient:
+    """Blocking Apollo config client.
 
-    A client instance is bound to the event loop it is first used in.
+    Namespaces are fetched on first access and then served from memory.
+    Call ``refresh()`` to pull the latest release.
     """
 
     def __init__(
@@ -31,35 +32,33 @@ class AsyncApolloClient:
         ip: str | None = None,
         label: str | None = None,
         timeout: float | None = None,
-        http_client: httpx.AsyncClient | None = None,
+        http_client: httpx.Client | None = None,
     ) -> None:
         self._settings = Settings(
             server_url.rstrip("/"), app_id, cluster, secret, ip, label, timeout
         )
-        self._http = http_client if http_client is not None else httpx.AsyncClient()
+        self._http = http_client if http_client is not None else httpx.Client()
         self._owns_http = http_client is None
         self._snapshots: dict[str, Snapshot] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: dict[str, threading.Lock] = {}
 
     @overload
-    async def get(self, key: str, *, namespace: str = DEFAULT_NAMESPACE) -> str | None: ...
+    def get(self, key: str, *, namespace: str = DEFAULT_NAMESPACE) -> str | None: ...
     @overload
-    async def get[T](
-        self, key: str, default: T, *, namespace: str = DEFAULT_NAMESPACE
-    ) -> str | T: ...
-    async def get(
+    def get[T](self, key: str, default: T, *, namespace: str = DEFAULT_NAMESPACE) -> str | T: ...
+    def get(
         self, key: str, default: object = None, *, namespace: str = DEFAULT_NAMESPACE
     ) -> object:
-        return (await self.namespace(namespace)).get(key, default)
+        return self.namespace(namespace).get(key, default)
 
-    async def namespace(self, name: str = DEFAULT_NAMESPACE) -> Mapping[str, str]:
+    def namespace(self, name: str = DEFAULT_NAMESPACE) -> Mapping[str, str]:
         name = normalize_namespace(name)
         snapshot = self._snapshots.get(name)
         if snapshot is None:
-            snapshot = await self._load(name, only_if_missing=True)
+            snapshot = self._load(name, only_if_missing=True)
         return snapshot.configurations
 
-    async def refresh(self, name: str | None = None) -> None:
+    def refresh(self, name: str | None = None) -> None:
         """Refetch one namespace, or every loaded namespace when ``name`` is None.
 
         A namespace that has not been loaded yet is loaded, so this can also be
@@ -67,35 +66,39 @@ class AsyncApolloClient:
         kept and the error is raised after all namespaces were tried.
         """
         names = [normalize_namespace(name)] if name is not None else list(self._snapshots)
-        results = await asyncio.gather(*(self._load(ns) for ns in names), return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+        error: Exception | None = None
+        for ns in names:
+            try:
+                self._load(ns)
+            except Exception as exc:
+                error = error or exc
+        if error is not None:
+            raise error
 
-    async def aclose(self) -> None:
+    def close(self) -> None:
         if self._owns_http:
-            await self._http.aclose()
+            self._http.close()
 
-    async def __aenter__(self) -> Self:
+    def __enter__(self) -> Self:
         return self
 
-    async def __aexit__(
+    def __exit__(
         self,
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        await self.aclose()
+        self.close()
 
-    async def _load(self, name: str, *, only_if_missing: bool = False) -> Snapshot:
-        async with self._locks.setdefault(name, asyncio.Lock()):
+    def _load(self, name: str, *, only_if_missing: bool = False) -> Snapshot:
+        with self._locks.setdefault(name, threading.Lock()):
             current = self._snapshots.get(name)
             if only_if_missing and current is not None:
                 return current
             release_key = current.release_key if current is not None else None
             try:
                 request = self._settings.build_config_request(self._http, name, release_key)
-                response = await self._http.send(request)
+                response = self._http.send(request)
             except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 raise ApolloError(f"failed to fetch namespace {name!r}: {exc}") from exc
             snapshot = parse_config_response(response, name)
