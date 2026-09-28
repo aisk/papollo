@@ -1,6 +1,7 @@
 import asyncio
+import inspect
 import sys
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from time import monotonic
 from types import TracebackType
 from typing import TypeVar, overload
@@ -24,6 +25,9 @@ from ._core import (
 from .exceptions import ApolloError
 
 T = TypeVar("T")
+
+AsyncListener = Callable[[str, Mapping[str, str], Mapping[str, str]], Awaitable[None] | None]
+L = TypeVar("L", bound=AsyncListener)
 
 
 class AsyncApollo:
@@ -54,6 +58,7 @@ class AsyncApollo:
         self._owns_http = http_client is None
         self._snapshots: dict[str, Snapshot] = {}
         self._fetched_at: dict[str, float] = {}
+        self._listeners: tuple[AsyncListener, ...] = ()
         self._locks: dict[str, asyncio.Lock] = {}
         _fork.track(self)
 
@@ -88,6 +93,20 @@ class AsyncApollo:
             if isinstance(result, BaseException):
                 raise result
 
+    def add_listener(self, callback: L) -> L:
+        """Call ``callback(namespace, old, new)`` when a loaded namespace's config changes.
+
+        The callback may be a coroutine function, it is then awaited. It is not called on first
+        load. It is called by whichever coroutine fetched the change, and exceptions it raises
+        are logged to the ``papollo`` logger. Returns the callback, so it can be a decorator.
+        """
+        if callback not in self._listeners:
+            self._listeners = (*self._listeners, callback)
+        return callback
+
+    def remove_listener(self, callback: AsyncListener) -> None:
+        self._listeners = tuple(cb for cb in self._listeners if cb != callback)
+
     async def aclose(self) -> None:
         if self._owns_http:
             await self._http.aclose()
@@ -119,20 +138,36 @@ class AsyncApollo:
         if lock.locked():
             return current
         async with lock:
+            before = self._snapshots[name]
             if not self._is_stale(name):
-                return self._snapshots[name]
+                return before
             try:
-                return await self._fetch(name)
+                snapshot = await self._fetch(name)
             except ApolloError as exc:
                 logger.warning("serving cached config after refresh failed: %s", exc)
-                return self._snapshots[name]
+                return before
+        await self._emit(name, before, snapshot)
+        return snapshot
 
     async def _load(self, name: str, *, only_if_missing: bool = False) -> Snapshot:
         async with self._locks.setdefault(name, asyncio.Lock()):
-            current = self._snapshots.get(name)
-            if only_if_missing and current is not None:
-                return current
-            return await self._fetch(name)
+            before = self._snapshots.get(name)
+            if only_if_missing and before is not None:
+                return before
+            snapshot = await self._fetch(name)
+        await self._emit(name, before, snapshot)
+        return snapshot
+
+    async def _emit(self, name: str, old: Snapshot | None, new: Snapshot) -> None:
+        if old is None or old is new or old.configurations == new.configurations:
+            return
+        for callback in self._listeners:
+            try:
+                result = callback(name, old.configurations, new.configurations)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # noqa: BLE001 a broken listener must not break the fetch
+                logger.exception("config change listener %r failed", callback)
 
     async def _fetch(self, name: str) -> Snapshot:
         """Fetch a namespace, the caller must hold its lock."""

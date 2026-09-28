@@ -131,6 +131,33 @@ def test_max_age(app: App, recorder: ResponseRecorder, clock: Clock) -> None:
     assert recorder.statuses == [200, 200, 304]
 
 
+def test_listener(app: App, client: Apollo) -> None:
+    changes: list[tuple[str, dict[str, str], dict[str, str]]] = []
+    listener = client.add_listener(lambda ns, old, new: changes.append((ns, dict(old), dict(new))))
+    client.get("timeout")
+    client.namespace("app.json")
+    client.refresh()
+    assert changes == []  # neither the first load nor a 304 is a change
+    app.publish("application", "timeout=60")
+    client.refresh()
+    assert changes == [("application", {"timeout": "30", "name": "demo"}, {"timeout": "60"})]
+    client.remove_listener(listener)
+    app.publish("application", "timeout=90")
+    client.refresh()
+    assert len(changes) == 1
+
+
+def test_listener_on_max_age(app: App, clock: Clock) -> None:
+    changes: list[str | None] = []
+    with Apollo(app.config_url, app.app_id, max_age=10) as client:
+        client.add_listener(lambda ns, old, new: changes.append(new.get("timeout")))
+        client.get("timeout")
+        app.publish("application", "timeout=60")
+        clock.now += 10
+        assert client.get("timeout") == "60"
+    assert changes == ["60"]
+
+
 @requires_fork
 def test_fork(app: App) -> None:
     with Apollo(app.config_url, app.app_id) as client:
@@ -280,6 +307,49 @@ def test_max_age_readers_do_not_wait(fake_apollo: FakeApollo, clock: Clock) -> N
         refresher.join(5)
         assert client.get("timeout") == "60"
     assert len(fake_apollo.requests) == 2
+
+
+def test_listener_errors_logged(
+    fake_client: Apollo, fake_apollo: FakeApollo, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls: list[str] = []
+
+    def broken(namespace: str, old: object, new: object) -> None:
+        raise RuntimeError("boom")
+
+    fake_client.add_listener(broken)
+    fake_client.add_listener(lambda ns, old, new: calls.append(ns))
+    fake_client.add_listener(broken)  # added once only
+    fake_client.get("timeout")
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    with caplog.at_level(logging.ERROR, logger="papollo"):
+        fake_client.refresh()
+    assert fake_client.get("timeout") == "60"
+    assert calls == ["application"]
+    [record] = caplog.records
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], RuntimeError)
+
+
+def test_listener_not_fired_for_same_configurations(
+    fake_client: Apollo, fake_apollo: FakeApollo
+) -> None:
+    calls: list[str] = []
+    fake_client.add_listener(lambda ns, old, new: calls.append(ns))
+    fake_client.get("timeout")
+    fake_apollo.publish("application", "r2", {"timeout": "30", "name": "demo"})
+    fake_client.refresh()
+    assert calls == []
+
+
+def test_listener_can_read(fake_client: Apollo, fake_apollo: FakeApollo) -> None:
+    seen: list[str | None] = []
+    # Runs outside the namespace lock, a read of the same namespace must not deadlock.
+    fake_client.add_listener(lambda ns, old, new: seen.append(fake_client.get("timeout")))
+    fake_client.get("timeout")
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    fake_client.refresh()
+    assert seen == ["60"]
 
 
 @requires_fork

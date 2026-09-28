@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 
 import httpx
 import pytest
@@ -81,6 +81,37 @@ async def test_max_age(app: App, recorder: ResponseRecorder, clock: Clock) -> No
         clock.now += 1
         assert await client.get("timeout") == "60"
     assert recorder.statuses == [200, 200]
+
+
+async def test_listener(app: App, client: AsyncApollo) -> None:
+    changes: list[tuple[str, dict[str, str], dict[str, str]]] = []
+
+    async def listener(namespace: str, old: Mapping[str, str], new: Mapping[str, str]) -> None:
+        await asyncio.sleep(0)
+        changes.append((namespace, dict(old), dict(new)))
+
+    client.add_listener(listener)
+    await client.get("timeout")
+    await client.refresh()
+    assert changes == []
+    app.publish("application", "timeout=60")
+    await client.refresh()
+    assert changes == [("application", {"timeout": "30", "name": "demo"}, {"timeout": "60"})]
+    client.remove_listener(listener)
+    app.publish("application", "timeout=90")
+    await client.refresh()
+    assert len(changes) == 1
+
+
+async def test_listener_on_max_age(app: App, clock: Clock) -> None:
+    changes: list[str | None] = []
+    async with AsyncApollo(app.config_url, app.app_id, max_age=10) as client:
+        client.add_listener(lambda ns, old, new: changes.append(new.get("timeout")))
+        await client.get("timeout")
+        app.publish("application", "timeout=60")
+        clock.now += 10
+        assert await client.get("timeout") == "60"
+    assert changes == ["60"]
 
 
 @requires_fork
@@ -199,3 +230,24 @@ async def test_max_age_readers_do_not_wait(fake_apollo: FakeApollo, clock: Clock
         gate.set()
         assert await refresher == "60"
     assert len(fake_apollo.requests) == 2
+
+
+async def test_listener_errors_logged(
+    fake_client: AsyncApollo, fake_apollo: FakeApollo, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls: list[str] = []
+
+    async def broken(namespace: str, old: object, new: object) -> None:
+        raise RuntimeError("boom")
+
+    fake_client.add_listener(broken)
+    fake_client.add_listener(lambda ns, old, new: calls.append(ns))
+    await fake_client.get("timeout")
+    fake_apollo.publish("application", "r2", {"timeout": "60"})
+    with caplog.at_level(logging.ERROR, logger="papollo"):
+        await fake_client.refresh()
+    assert await fake_client.get("timeout") == "60"
+    assert calls == ["application"]
+    [record] = caplog.records
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], RuntimeError)

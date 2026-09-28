@@ -1,6 +1,6 @@
 import sys
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from time import monotonic
 from types import TracebackType
 from typing import TypeVar, overload
@@ -24,6 +24,9 @@ from ._core import (
 from .exceptions import ApolloError
 
 T = TypeVar("T")
+
+Listener = Callable[[str, Mapping[str, str], Mapping[str, str]], None]
+L = TypeVar("L", bound=Listener)
 
 
 class Apollo:
@@ -55,6 +58,7 @@ class Apollo:
         self._owns_http = http_client is None
         self._snapshots: dict[str, Snapshot] = {}
         self._fetched_at: dict[str, float] = {}
+        self._listeners: tuple[Listener, ...] = ()
         self._locks: dict[str, threading.Lock] = {}
         _fork.track(self)
 
@@ -93,6 +97,20 @@ class Apollo:
         if error is not None:
             raise error
 
+    def add_listener(self, callback: L) -> L:
+        """Call ``callback(namespace, old, new)`` when a loaded namespace's config changes.
+
+        It is not called on first load. It runs in whichever thread fetched the change, a reader,
+        ``refresh()`` or the watch thread, and exceptions it raises are logged to the ``papollo``
+        logger. Returns the callback, so it can be used as a decorator.
+        """
+        if callback not in self._listeners:
+            self._listeners = (*self._listeners, callback)
+        return callback
+
+    def remove_listener(self, callback: Listener) -> None:
+        self._listeners = tuple(cb for cb in self._listeners if cb != callback)
+
     def close(self) -> None:
         if self._owns_http:
             self._http.close()
@@ -124,22 +142,37 @@ class Apollo:
         if not lock.acquire(blocking=False):
             return current
         try:
+            before = self._snapshots[name]
             if not self._is_stale(name):
-                return self._snapshots[name]
+                return before
             try:
-                return self._fetch(name)
+                snapshot = self._fetch(name)
             except ApolloError as exc:
                 logger.warning("serving cached config after refresh failed: %s", exc)
-                return self._snapshots[name]
+                return before
         finally:
             lock.release()
+        self._emit(name, before, snapshot)
+        return snapshot
 
     def _load(self, name: str, *, only_if_missing: bool = False) -> Snapshot:
         with self._locks.setdefault(name, threading.Lock()):
-            current = self._snapshots.get(name)
-            if only_if_missing and current is not None:
-                return current
-            return self._fetch(name)
+            before = self._snapshots.get(name)
+            if only_if_missing and before is not None:
+                return before
+            snapshot = self._fetch(name)
+        self._emit(name, before, snapshot)
+        return snapshot
+
+    def _emit(self, name: str, old: Snapshot | None, new: Snapshot) -> None:
+        # Called without the namespace lock held, so a listener may read any namespace.
+        if old is None or old is new or old.configurations == new.configurations:
+            return
+        for callback in self._listeners:
+            try:
+                callback(name, old.configurations, new.configurations)
+            except Exception:  # noqa: BLE001 a broken listener must not break the fetch
+                logger.exception("config change listener %r failed", callback)
 
     def _fetch(self, name: str) -> Snapshot:
         """Fetch a namespace, the caller must hold its lock."""
