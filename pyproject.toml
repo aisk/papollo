@@ -5,8 +5,11 @@ description = "Python client for Apollo config center, with sync and async suppo
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.14"
-dependencies = ["httpx>=0.28"]
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.28",
+    "typing-extensions>=4.0 ; python_full_version < '3.11'",
+]
 
 [dependency-groups]
 dev = [

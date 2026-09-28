@@ -1,9 +1,15 @@
 import asyncio
+import sys
 from collections.abc import Mapping
 from types import TracebackType
-from typing import Self, overload
+from typing import TypeVar, overload
 
 import httpx
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 
 from ._core import (
     DEFAULT_NAMESPACE,
@@ -13,6 +19,8 @@ from ._core import (
     parse_config_response,
 )
 from .exceptions import ApolloError
+
+T = TypeVar("T")
 
 
 class AsyncApollo:
@@ -44,9 +52,7 @@ class AsyncApollo:
     @overload
     async def get(self, key: str, *, namespace: str = DEFAULT_NAMESPACE) -> str | None: ...
     @overload
-    async def get[T](
-        self, key: str, default: T, *, namespace: str = DEFAULT_NAMESPACE
-    ) -> str | T: ...
+    async def get(self, key: str, default: T, *, namespace: str = DEFAULT_NAMESPACE) -> str | T: ...
     async def get(
         self, key: str, default: object = None, *, namespace: str = DEFAULT_NAMESPACE
     ) -> object:
