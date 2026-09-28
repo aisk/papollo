@@ -573,6 +573,13 @@ async def test_cache_fallback_status(
             assert info.value.status_code == status_code
 
 
+async def test_cache_not_served_for_bad_url(tmp_path: Path) -> None:
+    write_cache(tmp_path, "application", "r0", {"timeout": "10"})
+    async with AsyncApollo("apollo:8080", "demo", cache_dir=tmp_path) as client:
+        with pytest.raises(ApolloError):
+            await client.get("timeout")
+
+
 async def test_cache_refresh_raises_but_serves(
     fake_apollo: FakeApollo, fake_http: httpx.AsyncClient, tmp_path: Path
 ) -> None:

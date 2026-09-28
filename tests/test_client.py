@@ -678,6 +678,13 @@ def test_cache_fallback_status(
             assert info.value.status_code == status_code
 
 
+def test_cache_not_served_for_bad_url(tmp_path: Path) -> None:
+    write_cache(tmp_path, "application", "r0", {"timeout": "10"})
+    # A server URL without a scheme will never work, the cache must not hide that.
+    with Apollo("apollo:8080", "demo", cache_dir=tmp_path) as client, pytest.raises(ApolloError):
+        client.get("timeout")
+
+
 def test_cache_refresh_raises_but_serves(
     fake_apollo: FakeApollo, fake_http: httpx.Client, tmp_path: Path
 ) -> None:

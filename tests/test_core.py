@@ -198,6 +198,15 @@ def test_is_server_unavailable(status_code: int | None, expected: bool) -> None:
     assert is_server_unavailable(ApolloError("x", status_code=status_code)) is expected
 
 
+@pytest.mark.parametrize(
+    "cause", [httpx.InvalidURL("x"), httpx.UnsupportedProtocol("missing an 'http://'")]
+)
+def test_is_server_unavailable_not_for_bad_url(cause: Exception) -> None:
+    error = ApolloError("x")
+    error.__cause__ = cause
+    assert not is_server_unavailable(error)
+
+
 def test_cache_file_name() -> None:
     assert cache_file_name("demo", "default", "application") == "demo+default+application.json"
     assert cache_file_name("demo-1", "sh_2", "app.yaml") == "demo-1+sh_2+app.yaml.json"

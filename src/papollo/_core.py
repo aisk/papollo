@@ -183,9 +183,12 @@ def is_server_unavailable(error: ApolloError) -> bool:
     """Whether a failed fetch may be served from the local cache.
 
     Only when the server can not be reached or fails, a 4xx such as a wrong secret or an unknown
-    namespace is a configuration mistake that serving a stale cache would hide.
+    namespace is a configuration mistake that serving a stale cache would hide. So is a malformed
+    server URL, such as one without ``http://``.
     """
-    return error.status_code is None or error.status_code >= 500
+    if error.status_code is not None:
+        return error.status_code >= 500
+    return not isinstance(error.__cause__, (httpx.InvalidURL, httpx.UnsupportedProtocol))
 
 
 # Bumped when the cache file layout changes, files of another version are ignored.
