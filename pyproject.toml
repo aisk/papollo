@@ -1,6 +1,6 @@
 [project]
 name = "papollo"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for Apollo config center, with sync and async support"
 readme = "README.md"
 license = "MIT"
