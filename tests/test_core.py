@@ -1,3 +1,6 @@
+from dataclasses import replace
+from typing import Any
+
 import httpx
 import pytest
 
@@ -5,18 +8,9 @@ from papollo import ApolloError
 from papollo._core import Settings, normalize_namespace, parse_config_response, sign
 
 
-def make_settings(**overrides) -> Settings:
-    values = dict(
-        server_url="http://apollo:8080",
-        app_id="demo",
-        cluster="default",
-        secret=None,
-        ip=None,
-        label=None,
-        timeout=5.0,
-    )
-    values.update(overrides)
-    return Settings(**values)
+def make_settings(**overrides: Any) -> Settings:
+    defaults = Settings("http://apollo:8080", "demo", "default", None, None, None, 5.0)
+    return replace(defaults, **overrides)
 
 
 def test_sign_matches_java_client() -> None:

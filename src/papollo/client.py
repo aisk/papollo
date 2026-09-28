@@ -70,7 +70,7 @@ class ApolloClient:
         for ns in names:
             try:
                 self._load(ns)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 raised below after all were tried
                 error = error or exc
         if error is not None:
             raise error
