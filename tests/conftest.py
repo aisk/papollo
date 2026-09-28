@@ -335,6 +335,15 @@ def fast_retry(monkeypatch: pytest.MonkeyPatch) -> tuple[float, float]:
     return delays
 
 
+def retry_delays(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The delays logged by a failing poller, as formatted in the log messages."""
+    return [
+        record.getMessage().split("retrying in ")[1].split(" ")[0]
+        for record in caplog.records
+        if record.getMessage().startswith("watch failed")
+    ]
+
+
 def run_in_child(fn: Callable[[], object], timeout: int = 10) -> object:
     """Run ``fn`` in a forked child and return its result, or raise if it failed or hung."""
     read_fd, write_fd = os.pipe()

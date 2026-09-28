@@ -22,6 +22,7 @@ from .conftest import (
     ResponseRecorder,
     portal_session,
     requires_fork,
+    retry_delays,
     run_in_child,
     wait_until,
     write_cache,
@@ -555,14 +556,6 @@ def fake_watching(fake_apollo: FakeApollo) -> Iterator[Apollo]:
         ) as client,
     ):
         yield client
-
-
-def retry_delays(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [
-        record.getMessage().split("retrying in ")[1].split(" ")[0]
-        for record in caplog.records
-        if record.getMessage().startswith("watch failed")
-    ]
 
 
 def test_watch_refetch_sends_messages(fake_watching: Apollo, fake_apollo: FakeApollo) -> None:
