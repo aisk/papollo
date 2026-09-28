@@ -1,4 +1,6 @@
+import json
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any
 
 import httpx
@@ -8,7 +10,12 @@ from papollo import ApolloError
 from papollo._core import (
     Notification,
     Settings,
+    Snapshot,
+    cache_file_name,
+    dump_cache,
+    is_server_unavailable,
     normalize_namespace,
+    parse_cache,
     parse_config_response,
     parse_notifications_response,
     sign,
@@ -181,3 +188,65 @@ def test_parse_notifications_errors(response: httpx.Response) -> None:
     with pytest.raises(ApolloError) as info:
         parse_notifications_response(response)
     assert info.value.status_code == response.status_code
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [(None, True), (500, True), (503, True), (401, False), (404, False), (304, False)],
+)
+def test_is_server_unavailable(status_code: int | None, expected: bool) -> None:
+    assert is_server_unavailable(ApolloError("x", status_code=status_code)) is expected
+
+
+def test_cache_file_name() -> None:
+    assert cache_file_name("demo", "default", "application") == "demo+default+application.json"
+    assert cache_file_name("demo-1", "sh_2", "app.yaml") == "demo-1+sh_2+app.yaml.json"
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        ("..", "..", ".."),
+        ("../../etc", "default", "passwd"),
+        ("demo", "a/b", "..\\x"),
+        ("demo", "default", "/abs"),
+        ("demo", "default", "nul\0"),
+    ],
+)
+def test_cache_file_name_stays_in_directory(parts: tuple[str, str, str]) -> None:
+    name = cache_file_name(*parts)
+    assert "/" not in name and "\\" not in name and "\0" not in name
+    assert name not in (".", "..")
+
+
+def test_cache_file_name_unambiguous() -> None:
+    assert cache_file_name("a+b", "c", "d") != cache_file_name("a", "b+c", "d")
+    assert cache_file_name("a%2Fb", "c", "d") != cache_file_name("a/b", "c", "d")
+
+
+def test_cache_round_trip() -> None:
+    snapshot = Snapshot("r1", MappingProxyType({"k": "v", "unicode": "\u4e2d\ud800"}))
+    data = dump_cache(snapshot)
+    assert json.loads(data)["format"] == 1
+    assert parse_cache(data) == snapshot
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"not json",
+        b"\xff",
+        b"[]",
+        b'"x"',
+        b'{"releaseKey": "r1", "configurations": {}}',
+        b'{"format": 2, "releaseKey": "r1", "configurations": {}}',
+        b'{"format": 1, "configurations": {}}',
+        b'{"format": 1, "releaseKey": "r1", "configurations": 1}',
+        b'{"format": 1, "releaseKey": 1, "configurations": {}}',
+        b'{"format": 1, "releaseKey": "r1", "configurations": {"k": 1}}',
+    ],
+)
+def test_parse_cache_errors(data: bytes) -> None:
+    with pytest.raises(ValueError):
+        parse_cache(data)

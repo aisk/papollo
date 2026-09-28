@@ -177,3 +177,52 @@ def parse_notifications_response(response: httpx.Response) -> list[Notification]
         raise ApolloError(
             "invalid notifications response", status_code=response.status_code
         ) from exc
+
+
+def is_server_unavailable(error: ApolloError) -> bool:
+    """Whether a failed fetch may be served from the local cache.
+
+    Only when the server can not be reached or fails, a 4xx such as a wrong secret or an unknown
+    namespace is a configuration mistake that serving a stale cache would hide.
+    """
+    return error.status_code is None or error.status_code >= 500
+
+
+# Bumped when the cache file layout changes, files of another version are ignored.
+_CACHE_FORMAT = 1
+
+
+def cache_file_name(app_id: str, cluster: str, namespace: str) -> str:
+    """Return the cache file name, ``{appId}+{cluster}+{namespace}.json`` as the Java client.
+
+    The parts are percent encoded, so a ``/`` can not escape the cache directory and a ``+``
+    can not make two namespaces share a file. Common names are left as they are.
+    """
+    return "+".join(quote(part, safe="") for part in (app_id, cluster, namespace)) + ".json"
+
+
+def dump_cache(snapshot: Snapshot) -> bytes:
+    body = {
+        "format": _CACHE_FORMAT,
+        "releaseKey": snapshot.release_key,
+        "configurations": dict(snapshot.configurations),
+    }
+    # ASCII only, a lone surrogate from the server could not be encoded otherwise.
+    return json.dumps(body, indent=2, sort_keys=True).encode("ascii")
+
+
+def parse_cache(data: bytes) -> Snapshot:
+    """Parse a cache file written by ``dump_cache``, raise ValueError if it is not one."""
+    try:
+        body = json.loads(data)
+        if body["format"] != _CACHE_FORMAT:
+            raise ValueError(f"unsupported format {body['format']!r}")
+        release_key = body["releaseKey"]
+        configurations = dict(body["configurations"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"invalid config cache: {exc!r}") from exc
+    if not isinstance(release_key, str) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in configurations.items()
+    ):
+        raise ValueError("invalid config cache: not a string")
+    return Snapshot(release_key, MappingProxyType(configurations))
